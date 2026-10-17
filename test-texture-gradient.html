@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<!-- Copyright (c) 2026 CNCKitchen (Stefan Hermann) and contributors
+     SPDX-License-Identifier: AGPL-3.0-only -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>RUNNING: texture gradient worker checks</title>
+  <script type="importmap">{"imports":{"three":"./vendor/three/build/three.module.js"}}</script>
+</head>
+<body>
+<pre id="result">RUNNING: texture gradient worker checks</pre>
+<script type="module">
+import { GRADIENT_DEFAULTS } from './js/textureGradient.js';
+import { THREE } from './js/threeCompat.js';
+import { countEdgeDefects, countAreaSlivers } from './js/meshRepair.js';
+
+const report = text => {
+  document.getElementById('result').textContent = text;
+  document.title = text;
+  // Like test-worker.html, the local server log records the result if a
+  // headless browser cannot retrieve the page after asynchronous work.
+  fetch('/__test__/' + encodeURIComponent(text)).catch(() => {});
+};
+const assert = (value, message) => { if (!value) throw new Error(message); };
+const bounds = {
+  min: {x:-5,y:-5,z:-5}, max: {x:5,y:5,z:5},
+  size: {x:10,y:10,z:10}, center: {x:0,y:0,z:0},
+};
+const settings = {
+  mappingMode: 6, scaleU: 3.1, scaleV: 4.2, amplitude: 0.25, textureHeight: 0.25,
+  offsetU: 0.11, offsetV: 0.07, rotation: 12, refineLength: 1.25, maxTriangles: 800,
+  bottomAngleLimit: 0, topAngleLimit: 0, mappingBlend: 1, seamBandWidth: 0.5,
+  textureSmoothing: 0, blendNormalSmoothing: 4, capAngle: 20, boundaryFalloff: 0,
+  symmetricDisplacement: false, noDownwardZ: false, smoothBottom: false,
+  harvestFlatFaces: true, harvestTol: 0.005, preserveUntextured: true,
+  regularizeEnabled: false, snapSeamlessWrap: false,
+};
+function cubeSoup() {
+  const v = [[-5,-5,-5],[5,-5,-5],[5,5,-5],[-5,5,-5],[-5,-5,5],[5,-5,5],[5,5,5],[-5,5,5]];
+  const q = [[0,3,2,1],[4,5,6,7],[0,1,5,4],[2,3,7,6],[1,2,6,5],[3,0,4,7]];
+  return new Float32Array(q.flatMap(([a,b,c,d]) => [a,b,c,a,c,d].flatMap(i => v[i])));
+}
+const grey = [12,88,144,244,196,22,234,108,66,216,38,160,250,130,178,48];
+const map = { data: new Uint8ClampedArray(grey.flatMap(v => [v,v,v,255])), width: 4, height: 4 };
+function layer(extra = {}) {
+  return { imageData: map, imgWidth: 4, imgHeight: 4, settings: { ...settings, ...extra }, blendAdd: false };
+}
+function input(layers) {
+  return { positions: cubeSoup(), layers, settings, bounds, regularizeOpts: {}, mode: 'export' };
+}
+function checkMesh(result) {
+  assert(result.positions.length > 108, 'source mesh was not refined');
+  assert(result.normals.length === result.positions.length, 'missing normals');
+  assert(result.positions.every(Number.isFinite) && result.normals.every(Number.isFinite), 'non-finite coordinates');
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(result.positions, 3));
+  const defects = countEdgeDefects(geometry);
+  assert(defects.open === 0 && defects.nonManifold === 0 && countAreaSlivers(geometry) === 0, 'mesh defects');
+  geometry.dispose();
+  assert(result.runDecimation && result.repairStats, 'worker did not exercise decimation and repair');
+  assert(result.repairStats.open === 0 && result.repairStats.nonManifold === 0 && result.repairStats.slivers === 0, 'repair defects');
+  return result.positions;
+}
+const equal = (a, b) => a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
+
+let worker;
+try {
+  worker = new Worker(new URL('./js/exportWorker.js', import.meta.url), { type: 'module' });
+  const ready = new Promise((resolve, reject) => {
+    worker.onmessage = e => { if (e.data.type === 'ready') resolve(); };
+    worker.onerror = e => reject(new Error(e.message || 'worker startup failed'));
+  });
+  const timer = setTimeout(() => { report('RESULT: FAIL texture gradients (worker timeout)'); worker.terminate(); }, 45000);
+  await ready;
+  const run = (data, name) => new Promise((resolve, reject) => {
+    report('RUNNING: texture gradients — ' + name);
+    worker.onmessage = e => {
+      if (e.data.type === 'done') resolve(e.data.result);
+      else if (e.data.type === 'error') reject(new Error(e.data.message));
+    };
+    worker.onerror = e => reject(new Error(e.message || 'worker run failed'));
+    worker.postMessage({ cmd: 'run', input: data });
+  });
+  const baseline = checkMesh(await run(input([layer()]), 'legacy export'));
+  const disabled = checkMesh(await run(input([layer({ ...GRADIENT_DEFAULTS,
+    gradientDepthStart: 2, gradientDepthEnd: 0, gradientScaleStart: 0.25,
+    gradientScaleEnd: 4, gradientOpacityStart: 0, gradientOpacityEnd: 0 })]), 'disabled compatibility'));
+  assert(equal(baseline, disabled), 'disabled gradients changed legacy worker export');
+
+  const bottom = layer({ ...GRADIENT_DEFAULTS, gradientEnabled: true, gradientAxis: 'x',
+    gradientDepthStart: 0.25, gradientDepthEnd: 1.5 });
+  const hard = new Uint8Array([1,1,0,0,1,1,1,1,1,1,1,1]);
+  const exclude = new Float32Array(36);
+  hard.forEach((v, face) => exclude.fill(v, face * 3, face * 3 + 3));
+  const upper = { ...layer({ ...GRADIENT_DEFAULTS, gradientEnabled: true, gradientAxis: 'y',
+    gradientMode: 'band', gradientDepthStart: 0.5, gradientDepthEnd: 1,
+    gradientScaleStart: 0.75, gradientScaleEnd: 1.5,
+    gradientOpacityStart: 0, gradientOpacityEnd: 0.8 }), hardFaces: hard, exclude };
+  const cover = checkMesh(await run(input([bottom, upper]), 'masked gradient Cover'));
+  const add = checkMesh(await run(input([bottom, { ...upper, blendAdd: true }]), 'masked gradient Add'));
+  assert(!equal(baseline, cover), 'worker ignored per-layer gradients');
+  assert(!equal(cover, add), 'worker ignored Cover/Add composition');
+  clearTimeout(timer);
+  report('RESULT: PASS texture gradients — disabled legacy parity, masked Cover/Add, worker clone, finite closed meshes, decimation/repair');
+  worker.terminate();
+} catch (error) {
+  report('RESULT: FAIL texture gradients (' + error.message + ')');
+  worker?.terminate();
+}
+</script>
+</body>
+</html>

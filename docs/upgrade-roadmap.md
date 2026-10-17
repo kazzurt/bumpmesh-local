@@ -1,0 +1,14 @@
+# Recommended upgrades
+
+Based on upstream v1.4.0 source inspection and the fork audit on October 3, 2026. Local launch, offline libraries, 14 native local maps and per-layer texture gradients are implemented. On October 3 the user selected gradients as the sole current feature upgrade; all other items below remain deferred proposals. See texture-gradients.md for the completed feature.
+
+1. **Make Smart resolution consider every visible layer.** `js/main.js` → `applySmartResolution` currently passes only the active texture/settings to `computeSmartResolution`. Analyze each visible layer and use the finest required resolution within a shared memory budget, with a message when detail must be reduced. This is the highest priority for multiple textures.
+2. **Improve layer management.** Name, duplicate and reorder layers; copy masks between layers; save reusable stacks. The current strip supports selection, visibility, removal and Cover/Add, but not these workflow tools. More than four live layers requires shader changes or a compositor, not merely changing a constant.
+3. **Add printer-aware presets and calibration swatches.** Enter nozzle diameter/layer height and desired feature size; warn about relief too fine to print. Generate a small depth/scale coupon for each texture. Existing Smart resolution knows image detail, surface area and budget; the height warning uses a fraction of model bounds rather than print settings.
+4. **Add precise and reusable region selection.** Select a shell/body, a height band, or a geometric face group and transfer that mask between layers. Current tools are an adaptive brush and angle-based flood fill. This will make applying different materials to handles, bases and decorative bands much faster.
+5. **Offer a texture preparation panel.** Levels/contrast, threshold, crop, seamless repeat preview and deterministic mixing of maps. Current controls cover smoothing and inversion. Keep original images intact and save settings with the project.
+6. **Add batch variants and named recipes.** Export depth/scale/texture combinations with sensible filenames for print comparisons. Start with one model and one saved stack; a headless CLI can follow. PR #99 is an idea donor, but its code predates the new layers.
+
+Further useful candidates: preserve multi-part 3MF colors/extruder assignments (PR #111), filament appearance and FDM layer preview (Elliacness), explicit RAM budgets (PR #115), bounded simplification (PR #129), and an OrcaSlicer round trip (PR #112). See fork-comparison.md for links, current conflict status and caveats. Advanced mesh diagnostics already exist upstream; a useful upgrade is exposing final-export diagnostics and repair results in the UI instead of only logging them.
+
+Current scope: finish and use the gradient upgrade. No other proposed upgrades were implemented in this milestone; choose a subsequent feature with the user after practical use.

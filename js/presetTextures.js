@@ -4,6 +4,7 @@
  */
 
 import * as THREE from 'three';
+import { LOCAL_TEXTURE_PRESETS } from './localTexturePresets.js';
 
 const SIZE  = 512; // preset texture resolution for both preview and sampling
 // Custom uploads keep up to 2048 px (#89): squeezing an 8K heightmap into
@@ -131,10 +132,13 @@ const IMAGE_PRESETS = [
   { name: 'Wood 2',               url: 'textures/woodgrain_02.jpg',               thumb: 'textures/thumbs/woodgrain_02.webp',               defaultScale: 1.0,  category: 'natural' },
   { name: 'Wood 3',               url: 'textures/woodgrain_03.png',               thumb: 'textures/thumbs/woodgrain_03.webp',               defaultScale: 1.0,  category: 'natural' },
   { name: 'YYY',                  url: 'textures/hero-yyy.png',                   thumb: 'textures/thumbs/hero-yyy.webp',                   defaultScale: 1.0,  category: 'patterns', credit: 'hero' },
+  // Keep upstream entries in their original order: project/preset indices remain compatible.
+  ...LOCAL_TEXTURE_PRESETS,
 ];
 
 // Gallery filter groups, in display order. Labels are i18n keys.
 const PRESET_CATEGORIES = [
+  { id: 'local',     label: 'gallery.catLocal' },
   { id: 'geometric', label: 'gallery.catGeometric' },
   { id: 'patterns',  label: 'gallery.catPatterns' },
   { id: 'organic',   label: 'gallery.catOrganic' },

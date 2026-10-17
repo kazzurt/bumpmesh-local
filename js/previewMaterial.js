@@ -5,6 +5,7 @@
 
 import * as THREE from 'three';
 import { scaleMmToRelative } from './mapping.js';
+import { normalizeGradientSettings, TEXTURE_GRADIENT_GLSL } from './textureGradient.js';
 
 // Mapping mode constants (must match index.html <option value="…">)
 export const MODE_PLANAR_XY   = 0;
@@ -25,7 +26,8 @@ export const MAX_LAYERS = 4;
 //      The underlying geometry is never modified; amplitude scales bump intensity.
 //   2. Displacement preview: The vertex shader samples the same displacement
 //      textures and physically moves each vertex along its smooth normal.
-//      Fragment shader adds reduced bump mapping for sub-vertex detail.
+//      The fragment shader lights the displaced surface: the base mesh's
+//      crease-aware normal tilted by the height field's true slope.
 //
 // Texture layers: up to MAX_LAYERS height maps, each with its own projection
 // settings (uniform arrays indexed by layer) and its own per-vertex mask and
@@ -67,6 +69,8 @@ const sharedGLSL = /* glsl */`
   uniform float     topAngleLimit;
   uniform int       noDownwardZ;
   uniform int       useDisplacement;
+
+  ${TEXTURE_GRADIENT_GLSL}
 
   const float PI     = 3.14159265358979;
   const float TWO_PI = 6.28318530717959;
@@ -115,8 +119,8 @@ const sharedGLSL = /* glsl */`
   }
 
   // Sample layer l after applying scale + tiling (aspect-corrected)
-  float sampleMap(int l, vec2 rawUV) {
-    vec2 uv = (rawUV * layerAspect[l]) / layerScale[l] + layerOffset[l];
+  float sampleMap(int l, vec2 rawUV, float sizeFactor) {
+    vec2 uv = (rawUV * layerAspect[l]) / (layerScale[l] * sizeFactor) + layerOffset[l];
     float c = cos(layerRot[l]); float s = sin(layerRot[l]);
     uv -= 0.5;
     uv  = vec2(c * uv.x - s * uv.y, s * uv.x + c * uv.y);
@@ -136,18 +140,19 @@ const sharedGLSL = /* glsl */`
     int mappingMode = layerMode[l];
     float mappingBlend = layerBlend[l];
     float seamBandWidth = layerSeamBand[l];
+    float sizeFactor = textureGradient(l, pos).y;
     vec3 rel = pos - boundsCenter;
     float maxDim = max(boundsSize.x, max(boundsSize.y, boundsSize.z));
     float md = max(maxDim, 1e-4);
 
     if (mappingMode == 0) {
-      return sampleMap(l, vec2((pos.x - boundsMin.x) / md, (pos.y - boundsMin.y) / md));
+      return sampleMap(l, vec2((pos.x - boundsMin.x) / md, (pos.y - boundsMin.y) / md), sizeFactor);
 
     } else if (mappingMode == 1) {
-      return sampleMap(l, vec2((pos.x - boundsMin.x) / md, (pos.z - boundsMin.z) / md));
+      return sampleMap(l, vec2((pos.x - boundsMin.x) / md, (pos.z - boundsMin.z) / md), sizeFactor);
 
     } else if (mappingMode == 2) {
-      return sampleMap(l, vec2((pos.y - boundsMin.y) / md, (pos.z - boundsMin.z) / md));
+      return sampleMap(l, vec2((pos.y - boundsMin.y) / md, (pos.z - boundsMin.z) / md), sizeFactor);
 
     } else if (mappingMode == 3) {
       // Cylinder axis is +Z. Center XY and radius are user-controllable so
@@ -163,22 +168,22 @@ const sharedGLSL = /* glsl */`
       // with a smoothly varying UV (no discontinuity), preserving full detail.
       float seamBand = seamBandWidth * 0.1;
       float seamDist = min(u_cyl, 1.0 - u_cyl);
-      float hSide;
+      float hSide = 0.5;
       if (seamBand > 0.001 && seamDist < seamBand) {
         float d = u_cyl < 0.5 ? u_cyl : u_cyl - 1.0;
         float t = smoothstep(0.0, 1.0, (d + seamBand) / (2.0 * seamBand));
-        float hLeft  = sampleMap(l, vec2(1.0 + d, v_cyl));
-        float hRight = sampleMap(l, vec2(d, v_cyl));
+        float hLeft  = sampleMap(l, vec2(1.0 + d, v_cyl), sizeFactor);
+        float hRight = sampleMap(l, vec2(d, v_cyl), sizeFactor);
         hSide = mix(hLeft, hRight, t);
       } else {
-        hSide = sampleMap(l, vec2(u_cyl, v_cyl));
+        hSide = sampleMap(l, vec2(u_cyl, v_cyl), sizeFactor);
       }
 
       if (mappingBlend < 0.001) return hSide;
       float capThreshold = cos(radians(layerCapAngle[l]));
       float blendHalf = seamBandWidth * 0.5;
       float capW = smoothstep(capThreshold - blendHalf, capThreshold + blendHalf, abs(blendN.z));
-      float hCap  = sampleMap(l, vec2(cylRel2.x / C + 0.5, cylRel2.y / C + 0.5));
+      float hCap  = sampleMap(l, vec2(cylRel2.x / C + 0.5, cylRel2.y / C + 0.5), sizeFactor);
       return mix(hSide, hCap, capW);
 
     } else if (mappingMode == 4) {
@@ -193,11 +198,11 @@ const sharedGLSL = /* glsl */`
       if (seamBand > 0.001 && seamDist < seamBand) {
         float d = u_sph < 0.5 ? u_sph : u_sph - 1.0;
         float t = smoothstep(0.0, 1.0, (d + seamBand) / (2.0 * seamBand));
-        float hLeft  = sampleMap(l, vec2(1.0 + d, v_sph));
-        float hRight = sampleMap(l, vec2(d, v_sph));
+        float hLeft  = sampleMap(l, vec2(1.0 + d, v_sph), sizeFactor);
+        float hRight = sampleMap(l, vec2(d, v_sph), sizeFactor);
         return mix(hLeft, hRight, t);
       }
-      return sampleMap(l, vec2(u_sph, v_sph));
+      return sampleMap(l, vec2(u_sph, v_sph), sizeFactor);
 
     } else if (mappingMode == 5) {
       vec3 blend = abs(projN);
@@ -210,9 +215,9 @@ const sharedGLSL = /* glsl */`
       if (projN.y > 0.0) xzU = -xzU;
       float xyU = (pos.x - boundsMin.x) / md;
       if (projN.z < 0.0) xyU = -xyU;
-      float hXY = sampleMap(l, vec2(xyU, (pos.y - boundsMin.y) / md));
-      float hXZ = sampleMap(l, vec2(xzU, (pos.z - boundsMin.z) / md));
-      float hYZ = sampleMap(l, vec2(yzU, (pos.z - boundsMin.z) / md));
+      float hXY = sampleMap(l, vec2(xyU, (pos.y - boundsMin.y) / md), sizeFactor);
+      float hXZ = sampleMap(l, vec2(xzU, (pos.z - boundsMin.z) / md), sizeFactor);
+      float hYZ = sampleMap(l, vec2(yzU, (pos.z - boundsMin.z) / md), sizeFactor);
       return hXY * blend.z + hXZ * blend.y + hYZ * blend.x;
 
     } else {
@@ -223,9 +228,9 @@ const sharedGLSL = /* glsl */`
       if (projN.y > 0.0) xzU = -xzU;
       float xyU = (pos.x - boundsMin.x) / md;
       if (projN.z < 0.0) xyU = -xyU;
-      float hYZ = sampleMap(l, vec2(yzU, (pos.z - boundsMin.z) / md));
-      float hXZ = sampleMap(l, vec2(xzU, (pos.z - boundsMin.z) / md));
-      float hXY = sampleMap(l, vec2(xyU, (pos.y - boundsMin.y) / md));
+      float hYZ = sampleMap(l, vec2(yzU, (pos.z - boundsMin.z) / md), sizeFactor);
+      float hXZ = sampleMap(l, vec2(xzU, (pos.z - boundsMin.z) / md), sizeFactor);
+      float hXY = sampleMap(l, vec2(xyU, (pos.y - boundsMin.y) / md), sizeFactor);
       vec3 bN = blendN;
       vec3 absFaceN = abs(projN);
       float facePrimary = max(absFaceN.x, max(absFaceN.y, absFaceN.z));
@@ -235,6 +240,9 @@ const sharedGLSL = /* glsl */`
       vec3 wts = cubicBlendWeights(bN, mappingBlend, seamBandWidth);
       return hYZ * wts.x + hXZ * wts.y + hXY * wts.z;
     }
+    // Explicit fallback keeps ANGLE's lowered function-result temporary
+    // initialized even when it conservatively analyzes the nested returns.
+    return 0.5;
   }
 
   // Layer l's signed height in mm at a point (grey, centred if symmetric,
@@ -242,7 +250,7 @@ const sharedGLSL = /* glsl */`
   float layerHeightMm(int l, vec3 pos, vec3 projN, vec3 blendN) {
     float h = computeHeightAtPoint(l, pos, projN, blendN);
     if (layerSymmetric[l] == 1) h = h - 0.5;
-    return h * layerAmp[l];
+    return h * layerAmp[l] * textureGradient(l, pos).x;
   }
 
   // Composite the layers' heights with per-layer weights w (mask × falloff ×
@@ -251,7 +259,7 @@ const sharedGLSL = /* glsl */`
     float H = 0.0;
     for (int l = 0; l < MAX_LAYERS; l++) {
       if (l >= layerCount) break;
-      float wl = w[l];
+      float wl = w[l] * textureGradient(l, pos).z;
       float hl = layerHeightMm(l, pos, projN, blendN) * wl;
       if (layerAdd[l] == 1) H += hl;
       else H = H * (1.0 - wl) + hl;
@@ -275,6 +283,8 @@ const vertexShader = /* glsl */`
   varying vec3  vViewPos;     // view-space position (possibly displaced) → TBN & specular
   varying vec3  vNormal;      // view-space normal → lighting
   varying vec3  vSmoothNormal; // view-space smooth normal → smooth shading on masked faces
+  varying vec3  vBaseViewPos; // view-space position before displacement → 3D-preview slope
+  varying vec3  vBaseNormal;  // view-space smooth-or-hard-edge normal → 3D-preview lighting
   varying vec4  vLayerMask;
   varying vec4  vLayerFalloff;
   varying float vAngleMask;   // angle mask (hard per-face)
@@ -322,6 +332,11 @@ const vertexShader = /* glsl */`
     vNormal      = normalize(normalMatrix * fN);
     vec3 sN = length(smoothNormal) > 1e-6 ? normalize(smoothNormal) : safeN;
     vSmoothNormal = normalize(normalMatrix * sN);
+    // Base surface the 3D preview lights: the smooth normal where it stays
+    // within 30° of the face (round parts aren't faceted), the face normal
+    // where it bends further, i.e. at a hard edge (a cube stays crisp).
+    vBaseViewPos = (modelViewMatrix * vec4(position, 1.0)).xyz;
+    vBaseNormal  = normalize(normalMatrix * (dot(safeN, fN) > 0.866 ? safeN : fN));
     gl_Position  = projectionMatrix * mvPosition;
   }
 `;
@@ -342,6 +357,8 @@ const fragmentShader = /* glsl */`
   varying vec3  vViewPos;
   varying vec3  vNormal;
   varying vec3  vSmoothNormal;
+  varying vec3  vBaseViewPos;
+  varying vec3  vBaseNormal;
   varying vec4  vLayerMask;
   varying vec4  vLayerFalloff;
   varying float vAngleMask;
@@ -349,24 +366,46 @@ const fragmentShader = /* glsl */`
 
   #include <clipping_planes_pars_fragment>
 
-  // Fold layer l's screen-space height gradient (scaled by its amplitude and
-  // weighted by wl) into the running bump sums with the over/add recurrence.
-  void bumpLayer(int l, vec3 PN, float wl, inout float dhx, inout float dhy, inout float coverSum) {
-    float hRaw = computeHeightAtPoint(l, vModelPos, PN, vModelNormal);
-    float gx = dFdx(hRaw) * layerAmp[l];
-    float gy = dFdy(hRaw) * layerAmp[l];
+  // Steepest relief slope the shading uses, tan(70°). A height step sharper
+  // than a pixel would otherwise tip the normal past the horizon and flash
+  // white or black.
+  const float MAX_BUMP_SLOPE = 2.75;
+
+  // Differentiate depth and gradient coverage, while leaving painted-mask
+  // derivatives out so mask boundaries retain their existing clean shading.
+  // Tracking the preceding height also captures the slope of a crossfade
+  // between two different layers, including a constant grey texture.
+  // The slopes are per-pixel forward differences one screen pixel along the
+  // surface (stepX / stepY), not dFdx/dFdy of the height: many GPUs evaluate
+  // those once per 2×2 pixel quad, which made the relief blocky and lit
+  // single quads as sparkles.
+  void bumpLayer(int l, vec3 PN, vec3 stepX, vec3 stepY, float wl,
+                 inout float dhx, inout float dhy,
+                 inout float coverSum, inout float heightSum) {
+    float height = layerHeightMm(l, vModelPos, PN, vModelNormal);
+    float opacity = textureGradient(l, vModelPos).z;
+    float gx = layerHeightMm(l, vModelPos + stepX, PN, vModelNormal) - height;
+    float gy = layerHeightMm(l, vModelPos + stepY, PN, vModelNormal) - height;
+    float ox = textureGradient(l, vModelPos + stepX).z - opacity;
+    float oy = textureGradient(l, vModelPos + stepY).z - opacity;
+    float cover = wl * opacity;
     if (layerAdd[l] == 1) {
-      dhx += gx * wl; dhy += gy * wl; coverSum += wl;
+      dhx += gx * cover + height * wl * ox;
+      dhy += gy * cover + height * wl * oy;
+      coverSum += cover;
+      heightSum += height * cover;
     } else {
-      dhx = dhx * (1.0 - wl) + gx * wl;
-      dhy = dhy * (1.0 - wl) + gy * wl;
-      coverSum = coverSum * (1.0 - wl) + wl;
+      dhx = dhx * (1.0 - cover) + gx * cover + (height - heightSum) * wl * ox;
+      dhy = dhy * (1.0 - cover) + gy * cover + (height - heightSum) * wl * oy;
+      coverSum = coverSum * (1.0 - cover) + cover;
+      heightSum = heightSum * (1.0 - cover) + height * cover;
     }
   }
 
   void main() {
     // Flip normal for back faces so flipped-winding geometry still lights correctly.
-    vec3 N = normalize(vNormal) * (gl_FrontFacing ? 1.0 : -1.0);
+    float faceSign = gl_FrontFacing ? 1.0 : -1.0;
+    vec3 N = normalize(vNormal) * faceSign;
 
     // Face-stable projection normal via dFdx, shared by every layer.
     vec3 _dpx = dFdx(vModelPos);
@@ -407,9 +446,10 @@ const fragmentShader = /* glsl */`
     }
 
     // ── Bump mapping via screen-space height derivatives ──────────────────
-    // Derivatives are taken on each layer's RAW height and weighted
-    // afterwards, so 2×2 pixel quads spanning mask boundaries don't produce
-    // large derivative spikes that bleed bump artifacts across the edge.
+    // Derivatives include each layer's continuous depth/coverage gradient,
+    // while painted mask weights are applied afterwards, so 2×2 pixel quads
+    // spanning mask boundaries don't produce large derivative spikes that
+    // bleed bump artifacts across the edge.
     // The weighted sums follow the same over/add recurrence as the height,
     // so the bump matches the composited relief. coverSum tracks how much of
     // the fragment any layer textures (shading blends to the smooth normal
@@ -419,38 +459,64 @@ const fragmentShader = /* glsl */`
     // backend (Chrome/Edge on Windows) turns dFdx/dFdy inside a loop that
     // breaks on a uniform into code that silently yields zero, which made the
     // preview surface look flat while the silhouette still displaced.
-    float dhx = 0.0, dhy = 0.0, coverSum = 0.0;
-    bumpLayer(0, PN, w.x, dhx, dhy, coverSum);
-    if (layerCount > 1) bumpLayer(1, PN, w.y, dhx, dhy, coverSum);
-    if (layerCount > 2) bumpLayer(2, PN, w.z, dhx, dhy, coverSum);
-    if (layerCount > 3) bumpLayer(3, PN, w.w, dhx, dhy, coverSum);
+    float dhx = 0.0, dhy = 0.0, coverSum = 0.0, heightSum = 0.0;
+    bumpLayer(0, PN, _dpx, _dpy, w.x, dhx, dhy, coverSum, heightSum);
+    if (layerCount > 1) bumpLayer(1, PN, _dpx, _dpy, w.y, dhx, dhy, coverSum, heightSum);
+    if (layerCount > 2) bumpLayer(2, PN, _dpx, _dpy, w.z, dhx, dhy, coverSum, heightSum);
+    if (layerCount > 3) bumpLayer(3, PN, _dpx, _dpy, w.w, dhx, dhy, coverSum, heightSum);
     coverSum = clamp(coverSum, 0.0, 1.0);
 
     vec3 dp1 = dFdx(vViewPos);
     vec3 dp2 = dFdy(vViewPos);
+    // A pixel's footprint on the undisplaced surface (3D preview slope).
+    vec3 sigS = dFdx(vBaseViewPos);
+    vec3 sigT = dFdy(vBaseViewPos);
 
-    vec3 T = dp1 - dot(dp1, N) * N;
-    vec3 B = dp2 - dot(dp2, N) * N;
-    float lenT = length(T);
-    float lenB = length(B);
-    T = lenT > 1e-5 ? T / lenT : vec3(1.0, 0.0, 0.0);
-    B = lenB > 1e-5 ? B / lenB : vec3(0.0, 1.0, 0.0);
+    vec3 bumpN, specN;   // shading normal, and the one highlights use
+    if (useDisplacement == 1) {
+      // 3D preview: light the displaced surface. Its normal is the base
+      // surface's crease-aware normal tilted by the composite height's
+      // surface gradient (Mikkelsen, "Bump Mapping Unparametrized Surfaces
+      // on the GPU"), taken on the undisplaced surface the height is a
+      // function of. True slope, so shading matches the displaced geometry
+      // (and the print), smooth across the preview triangles.
+      vec3 N0 = normalize(vBaseNormal) * faceSign;
+      vec3 R1 = cross(sigT, N0);
+      vec3 R2 = cross(N0, sigS);
+      float det = dot(sigS, R1) * faceSign;
+      vec3 grad = sign(det) * (dhx * R1 + dhy * R2);
+      float maxGrad = MAX_BUMP_SLOPE * abs(det);
+      float gradLen = length(grad);
+      if (gradLen > maxGrad) grad *= maxGrad / gradLen;
+      bumpN = abs(det) > 1e-20 ? normalize(abs(det) * N0 - grad) : N0;
+      specN = bumpN;
+    } else {
+      vec3 T = dp1 - dot(dp1, N) * N;
+      vec3 B = dp2 - dot(dp2, N) * N;
+      float lenT = length(T);
+      float lenB = length(B);
+      T = lenT > 1e-5 ? T / lenT : vec3(1.0, 0.0, 0.0);
+      B = lenB > 1e-5 ? B / lenB : vec3(0.0, 1.0, 0.0);
 
-    // When vertex displacement is active, reduce bump strength: the macro shape
-    // is already physical; bump only adds sub-vertex fine detail.
-    float posScale = max(length(dp1) + length(dp2), 1e-6);
-    float bumpStr  = useDisplacement == 1
-      ? 2.0 / posScale
-      : 6.0 / posScale;
+      // Bump-only: the relief is exaggerated (×3) so it reads on the flat mesh.
+      float posScale = max(length(dp1) + length(dp2), 1e-6);
+      float bumpStr  = 6.0 / posScale;
+      vec3 tilt = bumpStr * (dhx * T + dhy * B);
+      float tiltLen = length(tilt);
+      if (tiltLen > MAX_BUMP_SLOPE) tilt *= MAX_BUMP_SLOPE / tiltLen;
+      vec3 bumpVec = N - tilt;
+      bumpN = length(bumpVec) > 1e-6 ? normalize(bumpVec) : N;
+      // Highlights follow the true slope (×1, as in the 3D preview): the
+      // exaggerated one put a pin-point glint on every bump — the sparkle.
+      specN = normalize(N - tilt / 3.0);
 
-    vec3 bumpVec = N - bumpStr * (dhx * T + dhy * B);
-    vec3 bumpN = length(bumpVec) > 1e-6 ? normalize(bumpVec) : N;
-
-    // On fully masked faces the bump derivatives are zero, so bumpN falls
-    // back to the flat face normal → faceted/static look.  Blend toward
-    // the smooth interpolated normal so masked areas get smooth shading.
-    vec3 smoothN = normalize(vSmoothNormal) * (gl_FrontFacing ? 1.0 : -1.0);
-    bumpN = mix(smoothN, bumpN, coverSum);
+      // On fully masked faces the bump derivatives are zero, so bumpN falls
+      // back to the flat face normal → faceted/static look.  Blend toward
+      // the smooth interpolated normal so masked areas get smooth shading.
+      vec3 smoothN = normalize(vSmoothNormal) * faceSign;
+      bumpN = mix(smoothN, bumpN, coverSum);
+      specN = mix(smoothN, specN, coverSum);
+    }
 
     // ── Shading ───────────────────────────────────────────────────────────
     // Compute lighting identically for ALL surfaces using the teal base so
@@ -474,7 +540,7 @@ const fragmentShader = /* glsl */`
     float diff2 = max(dot(bumpN, L2), 0.0) * 0.35;
 
     vec3 H1   = normalize(L1 + V);
-    float spec = pow(max(dot(bumpN, H1), 0.0), 64.0) * 0.60;
+    float spec = pow(max(dot(specN, H1), 0.0), 64.0) * 0.60;
 
     // Lit teal (identical for textured and masked surfaces)
     vec3 litTeal = tealBase * 0.55
@@ -532,7 +598,7 @@ export function createPreviewMaterial(layers, settings) {
  *   (at most MAX_LAYERS), each: { texture, mappingMode, scaleU, scaleV,
  *   offsetU, offsetV, rotation, amplitude, symmetricDisplacement,
  *   mappingBlend, seamBandWidth, capAngle, cylinderCenterX, cylinderCenterY,
- *   cylinderRadius, textureAspectU, textureAspectV, blendAdd }
+ *   cylinderRadius, textureAspectU, textureAspectV, blendAdd, gradient* }
  * @param {object} settings  { bounds, bottomAngleLimit, topAngleLimit,
  *   noDownwardZ, useDisplacement, activeLayer (index into `layers`),
  *   boundaryFalloff, boundaryFalloffCurve (the active layer's, for the
@@ -575,6 +641,19 @@ export function updateMaterial(material, layers, settings) {
     u.layerAspect.value[l * 2]     = L ? (L.textureAspectU ?? 1) : 1;
     u.layerAspect.value[l * 2 + 1] = L ? (L.textureAspectV ?? 1) : 1;
     u.layerAdd.value[l]        = L && L.blendAdd ? 1 : 0;
+    const gradient = normalizeGradientSettings(L);
+    u.layerGradientEnabled.value[l] = gradient.gradientEnabled ? 1 : 0;
+    u.layerGradientAxis.value[l] = { x: 0, y: 1, z: 2 }[gradient.gradientAxis];
+    u.layerGradientMode.value[l] = gradient.gradientMode === 'band' ? 1 : 0;
+    u.layerGradientCurve.value[l] = gradient.gradientCurve === 'smooth' ? 1 : 0;
+    u.layerGradientExtent.value[l * 2] = gradient.gradientStart;
+    u.layerGradientExtent.value[l * 2 + 1] = gradient.gradientEnd;
+    u.layerGradientDepth.value[l * 2] = gradient.gradientDepthStart;
+    u.layerGradientDepth.value[l * 2 + 1] = gradient.gradientDepthEnd;
+    u.layerGradientScale.value[l * 2] = gradient.gradientScaleStart;
+    u.layerGradientScale.value[l * 2 + 1] = gradient.gradientScaleEnd;
+    u.layerGradientOpacity.value[l * 2] = gradient.gradientOpacityStart;
+    u.layerGradientOpacity.value[l * 2 + 1] = gradient.gradientOpacityEnd;
   }
   u.boundsMin.value.copy(b.min);
   u.boundsSize.value.copy(b.size);
@@ -611,6 +690,14 @@ function buildUniforms() {
     layerSymmetric: { value: new Int32Array(MAX_LAYERS) },
     layerAspect:    { value: new Float32Array(MAX_LAYERS * 2) },
     layerAdd:       { value: new Int32Array(MAX_LAYERS) },
+    layerGradientEnabled: { value: new Int32Array(MAX_LAYERS) },
+    layerGradientAxis:    { value: new Int32Array(MAX_LAYERS) },
+    layerGradientMode:    { value: new Int32Array(MAX_LAYERS) },
+    layerGradientCurve:   { value: new Int32Array(MAX_LAYERS) },
+    layerGradientExtent:  { value: new Float32Array(MAX_LAYERS * 2) },
+    layerGradientDepth:   { value: new Float32Array(MAX_LAYERS * 2) },
+    layerGradientScale:   { value: new Float32Array(MAX_LAYERS * 2) },
+    layerGradientOpacity: { value: new Float32Array(MAX_LAYERS * 2) },
     boundsMin:        { value: new THREE.Vector3() },
     boundsSize:       { value: new THREE.Vector3(1, 1, 1) },
     boundsCenter:     { value: new THREE.Vector3() },

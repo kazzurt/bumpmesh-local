@@ -15,18 +15,18 @@
  *      HTML spec, so a bare 'three' import throws there).
  * The try/catch below uses the bare specifier wherever it resolves (page,
  * Node — same module instance as the rest of the app, so instanceof checks
- * hold) and falls back to the CDN URL only inside workers.
+ * hold) and falls back to the local vendored URL only inside workers.
  *
  * KEEP THE URL IN SYNC with the import map in index.html. The page will
- * usually have the file in HTTP cache already, so the worker fetch is cheap.
+ * usually have the file in local HTTP cache already, so the worker fetch is cheap.
  */
-const CDN_THREE = 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js';
+const LOCAL_THREE = new URL('../vendor/three/build/three.module.js', import.meta.url).href;
 
 let THREE;
 try {
   THREE = await import('three');
 } catch {
-  THREE = await import(CDN_THREE);
+  THREE = await import(LOCAL_THREE);
 }
 
 export { THREE };

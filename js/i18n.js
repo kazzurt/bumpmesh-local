@@ -29,6 +29,8 @@ export const TRANSLATIONS = {
 
 let _currentLang = 'en';
 const _cache = {};
+// Local additions fall back to English until translated in individual language files.
+const _localFallback = { 'gallery.catLocal': 'Local library' };
 
 /**
  * Load a language file into the cache.
@@ -56,7 +58,7 @@ async function _loadLang(lang) {
 function _interpolate(key, params, escape) {
   const strings  = _cache[_currentLang] ?? _cache.en ?? {};
   const fallback = _cache.en ?? {};
-  let str = strings[key] ?? fallback[key] ?? key;
+  let str = strings[key] ?? fallback[key] ?? _localFallback[key] ?? key;
 
   for (const [k, v] of Object.entries(params)) {
     str = str.replaceAll(`{${k}}`, escape ? _escapeHtml(v) : v);

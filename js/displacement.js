@@ -6,6 +6,7 @@
 import { THREE } from './threeCompat.js';
 import { computeUV, getDominantCubicAxis, getCubicBlendWeights, scaleMmToRelative } from './mapping.js';
 import { QuantizedPointMap } from './meshIndex.js';
+import { createTextureGradientEvaluator } from './textureGradient.js';
 
 // ── Sharp-crease handling (see _findCreases / _creaseMoves) ─────────────────
 // Buffer normals within this angle belong to the same smooth group
@@ -76,7 +77,7 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
  *   settings   per-layer projection/displacement settings (mappingMode,
  *              scaleU/V, offsetU/V, rotation, amplitude, symmetricDisplacement,
  *              mappingBlend, seamBandWidth, capAngle, cylinder*, boundaryFalloff,
- *              boundaryFalloffCurve)
+ *              boundaryFalloffCurve, gradient* from textureGradient.js)
  *   exclude    Float32Array|null  per-corner exclusion amount on `geometry`
  *              (1 = untextured, 0 = full texture; between = soft brush)
  *   hardFaces  Uint8Array|null    per-triangle flag: fully untextured by the
@@ -456,6 +457,12 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
     const aspectU = tmax / Math.max(imgWidth, 1);
     const aspectV = tmax / Math.max(imgHeight, 1);
     const settingsWithAspect = { ...lset, textureAspectU: aspectU, textureAspectV: aspectV };
+    const evaluateGradient = createTextureGradientEvaluator(lset, bounds);
+    const gradientAtPoint = { depth: 1, scale: 1, opacity: 1 };
+    // Only enabled layers allocate the extra factors. Shared vertex copies
+    // (including crease groups) use identical gradient factors.
+    const gradientDepth = lset.gradientEnabled === true ? new Float64Array(uniqueCount) : null;
+    const gradientOpacity = lset.gradientEnabled === true ? new Float64Array(uniqueCount) : null;
 
     // Positions this layer pins at zero: faces no layer textures / angle-
     // masked faces (excludedPos, from excludeWeight) plus the layer's own
@@ -473,6 +480,7 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
 
     const md = Math.max(bounds.size.x, bounds.size.y, bounds.size.z, 1e-6);
     const relScale = scaleMmToRelative(6, lset, bounds);
+    const baseRelScaleU = relScale.u, baseRelScaleV = relScale.v;
     const rotRad = (lset.rotation ?? 0) * Math.PI / 180;
     const cubicBlend = lset.mappingBlend ?? 0;
     const cubicBandWidth = lset.seamBandWidth ?? 0.35;
@@ -486,6 +494,18 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
       dispCacheSet[vid] = 1;
 
       tmpPos.fromBufferAttribute(posAttr, i);
+      if (gradientDepth) {
+        evaluateGradient(tmpPos, gradientAtPoint);
+        gradientDepth[vid] = gradientAtPoint.depth;
+        gradientOpacity[vid] = gradientAtPoint.opacity;
+        // The simple spatial size gradient continuously stretches the
+        // projection. Reuse settings and scales rather than allocating per
+        // vertex; both generic and cubic mapping see the same multiplier.
+        settingsWithAspect.scaleU = lset.scaleU * gradientAtPoint.scale;
+        settingsWithAspect.scaleV = lset.scaleV * gradientAtPoint.scale;
+        relScale.u = baseRelScaleU * gradientAtPoint.scale;
+        relScale.v = baseRelScaleV * gradientAtPoint.scale;
+      }
 
       // Crease position: one sample per face group meeting here, each with
       // that group's (smoothed) blend normal and its own normal for the
@@ -575,6 +595,7 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
       const centeredGrey = symmetric ? (grey - 0.5) : grey;
       const falloffFactor = falloffArr ? falloffArr[vid] : 1.0;
       let disp = pinned ? 0 : falloffFactor * (1 - maskedFrac) * centeredGrey * amplitude;
+      if (gradientDepth) disp *= gradientDepth[vid] * gradientOpacity[vid];
       if (softMax) disp *= 1 - softMax[vid];
       if (li === 0) {
         acc[vid] = disp;
@@ -582,7 +603,13 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
         acc[vid] += disp;
       } else {
         // "Over": where this layer covers, the layers below fade out.
-        const cover = pinned ? 0 : (softMax ? 1 - softMax[vid] : 1);
+        const maskCover = pinned ? 0 : (softMax ? 1 - softMax[vid] : 1);
+        // Gradient crossfades use the complete preview weight at faded or
+        // angle-masked boundaries. Disabled layers retain the legacy cover
+        // coefficient exactly for old project/export compatibility.
+        const cover = gradientOpacity
+          ? maskCover * falloffFactor * (1 - maskedFrac) * gradientOpacity[vid]
+          : maskCover;
         acc[vid] = acc[vid] * (1 - cover) + disp;
       }
     }
@@ -600,13 +627,17 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
           const maskedFrac = gArea > 0 ? creases.masked[k] / gArea : 0;
           const centeredGrey = symmetric ? (groupGrey[k] - 0.5) : groupGrey[k];
           let disp = pinned ? 0 : falloffFactor * (1 - maskedFrac) * centeredGrey * amplitude;
+          if (gradientDepth) disp *= gradientDepth[vid] * gradientOpacity[vid];
           if (softMax) disp *= 1 - softMax[vid];
           if (li === 0) {
             groupAcc[k] = disp;
           } else if (blendAdd) {
             groupAcc[k] += disp;
           } else {
-            const cover = pinned ? 0 : (softMax ? 1 - softMax[vid] : 1);
+            const maskCover = pinned ? 0 : (softMax ? 1 - softMax[vid] : 1);
+            const cover = gradientOpacity
+              ? maskCover * falloffFactor * (1 - maskedFrac) * gradientOpacity[vid]
+              : maskCover;
             groupAcc[k] = groupAcc[k] * (1 - cover) + disp;
           }
         }

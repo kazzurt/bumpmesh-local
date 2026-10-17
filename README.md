@@ -1,3 +1,28 @@
+# BumpMesh Local by Kurt
+
+A personal fork of [CNC Kitchen's BumpMesh](https://github.com/CNCKitchen/stlTexturizer), based on v1.4.0 (`ee02c39`). Original BumpMesh author: Stefan Hermann / CNC Kitchen. This fork retains the upstream license and attribution.
+
+**Fork:** https://github.com/kazzurt/bumpmesh-local
+
+**Development branch:** `local/kurtz-texture-library`
+
+## What's added in this fork
+
+- Per-layer texture gradients for depth, pattern size and opacity, with presets and saved-project support.
+- A searchable local library of 14 additional texture maps.
+- Bundled runtime dependencies and Windows launch/stop scripts for local use without CDN dependencies.
+- Fixes for legacy and settings-only project mask imports and coarse-mesh boundary-falloff previews.
+- Persistent 3D Preview selection, improved displaced-surface lighting and reduced highlight sparkle.
+- A customized header and removal of export/store promotional popups and banners.
+
+## Run locally
+
+Install Node.js, then double-click **Start-BumpMesh.cmd** on Windows, or run `npm start` from this folder. Open http://127.0.0.1:8765. Runtime libraries are included. For development and tests, run `npm ci --ignore-scripts`, `npm test`, and `npm run test:paint`.
+
+See [the local guide](LOCAL-README.md), [texture gradient examples](docs/texture-gradients.md), and [project notes and known limitations](docs/project-notes.md). Original upstream documentation follows; bumpmesh.com is the original project's hosted application.
+
+---
+
 # BumpMesh by CNC Kitchen
 
 **Live:** https://bumpmesh.com  

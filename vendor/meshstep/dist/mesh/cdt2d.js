@@ -1,0 +1,1353 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// meshStep — robust 2D constrained Delaunay triangulation (incremental Bowyer-Watson insertion
+// with neighbour links, constraint forcing, and region extraction by constraint-parity flood
+// fill). Unlike a batch hull triangulation this is robust on collinear boundaries (e.g. a
+// cylinder rim, which projects to a straight line of points) and on dense inputs.
+/** Diagnostics for the gapcheck harness (MESHSTEP_DEBUG=1); no-op in production/browser. */
+const DBG = typeof process !== "undefined" && !!process.env?.MESHSTEP_DEBUG;
+const orient = (a, b, c) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+/** True if d is strictly inside the circumcircle of CCW triangle a,b,c. */
+function inCircle(a, b, c, d) {
+    const ax = a[0] - d[0], ay = a[1] - d[1];
+    const bx = b[0] - d[0], by = b[1] - d[1];
+    const cx = c[0] - d[0], cy = c[1] - d[1];
+    const det = (ax * ax + ay * ay) * (bx * cy - cx * by)
+        - (bx * bx + by * by) * (ax * cy - cx * ay)
+        + (cx * cx + cy * cy) * (ax * by - bx * ay);
+    return det > 1e-12;
+}
+function segCross(p, q, r, s) {
+    const d1 = orient(r, s, p), d2 = orient(r, s, q), d3 = orient(p, q, r), d4 = orient(p, q, s);
+    return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+}
+/**
+ * Triangle store, struct-of-arrays: slot i holds vertices tv[3i..3i+2], neighbour slots
+ * tn[3i..3i+2] (-1 = none), and a dead flag. Replaces the old one-object-per-triangle store —
+ * insertPoint allocated ~7 heap objects per insertion and was the hottest function in the whole
+ * pipeline. Slots are recycled through `free` (LIFO) exactly like before, so slot assignment —
+ * and therefore every downstream iteration order and the final mesh — is bit-identical.
+ * seenEpoch is insertPoint's per-slot cavity stamp (epoch-compared, never cleared).
+ */
+class Cdt {
+    tv;
+    tn;
+    dead;
+    seenEpoch;
+    nt = 0; // slots allocated (live + dead) — the old tris.length
+    free = [];
+    epoch = 0;
+    constructor(cap) {
+        cap = Math.max(cap, 4);
+        this.tv = new Int32Array(cap * 3);
+        this.tn = new Int32Array(cap * 3);
+        this.dead = new Uint8Array(cap);
+        this.seenEpoch = new Uint32Array(cap);
+    }
+    /** New triangle in a recycled slot if available, else appended (arrays grow by doubling). */
+    alloc(a, b, c, n0, n1, n2) {
+        let idx;
+        if (this.free.length)
+            idx = this.free.pop();
+        else {
+            if (this.nt === this.dead.length) {
+                const tv = new Int32Array(this.tv.length * 2);
+                tv.set(this.tv);
+                this.tv = tv;
+                const tn = new Int32Array(this.tn.length * 2);
+                tn.set(this.tn);
+                this.tn = tn;
+                const dd = new Uint8Array(this.dead.length * 2);
+                dd.set(this.dead);
+                this.dead = dd;
+                const se = new Uint32Array(this.seenEpoch.length * 2);
+                se.set(this.seenEpoch);
+                this.seenEpoch = se;
+            }
+            idx = this.nt++;
+        }
+        const o = idx * 3;
+        this.tv[o] = a;
+        this.tv[o + 1] = b;
+        this.tv[o + 2] = c;
+        this.tn[o] = n0;
+        this.tn[o + 1] = n1;
+        this.tn[o + 2] = n2;
+        this.dead[idx] = 0;
+        return idx;
+    }
+    kill(t) { this.dead[t] = 1; this.free.push(t); }
+    firstLive() { for (let i = 0; i < this.nt; i++)
+        if (!this.dead[i])
+            return i; return -1; }
+}
+const ckey = (a, b) => (a < b ? a * 0x8000000 + b : b * 0x8000000 + a);
+/** In triangle ti, set the neighbour across edge (x,y) to value. */
+function setNeighbor(m, ti, x, y, value) {
+    if (ti < 0)
+        return;
+    const o = ti * 3;
+    for (let e = 0; e < 3; e++) {
+        const a = m.tv[o + e], b = m.tv[o + ((e + 1) % 3)];
+        if ((a === x && b === y) || (a === y && b === x)) {
+            m.tn[o + e] = value;
+            return;
+        }
+    }
+}
+/** Even-odd point-in-polygon test (ray casting) on a vertex ring. */
+function pnpoly(px, py, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const a = poly[i], b = poly[j];
+        if ((a[1] > py) !== (b[1] > py)) {
+            const x = ((b[0] - a[0]) * (py - a[1])) / (b[1] - a[1]) + a[0];
+            if (px < x)
+                inside = !inside;
+        }
+    }
+    return inside;
+}
+function pointInTri(p, a, b, c) {
+    const d1 = orient(a, b, p), d2 = orient(b, c, p), d3 = orient(c, a, p);
+    return !((d1 < -1e-9 || d2 < -1e-9 || d3 < -1e-9) && (d1 > 1e-9 || d2 > 1e-9 || d3 > 1e-9));
+}
+function locate(m, pts, pi, hint) {
+    const p = pts[pi];
+    let t = hint >= m.nt || m.dead[hint] ? m.firstLive() : hint;
+    for (let steps = 0; steps < m.nt * 3 + 8; steps++) {
+        const o = t * 3;
+        let moved = false;
+        for (let e = 0; e < 3; e++) {
+            if (orient(pts[m.tv[o + e]], pts[m.tv[o + ((e + 1) % 3)]], p) < -1e-12) {
+                const nb = m.tn[o + e];
+                if (nb >= 0 && !m.dead[nb]) {
+                    t = nb;
+                    moved = true;
+                    break;
+                }
+            }
+        }
+        if (!moved)
+            return t;
+    }
+    for (let i = 0; i < m.nt; i++) {
+        if (m.dead[i])
+            continue;
+        const o = i * 3;
+        if (pointInTri(p, pts[m.tv[o]], pts[m.tv[o + 1]], pts[m.tv[o + 2]]))
+            return i;
+    }
+    return m.firstLive();
+}
+function insertPoint(m, pts, pi, hint, s) {
+    const start = locate(m, pts, pi, hint);
+    // Collect the cavity: triangles whose circumcircle contains p, grown across shared edges.
+    const epoch = ++m.epoch;
+    const { bad, stack, made, ea, eb, eext } = s;
+    bad.length = 0;
+    stack.length = 0;
+    made.length = 0;
+    ea.length = 0;
+    eb.length = 0;
+    eext.length = 0;
+    const P = pts[pi];
+    m.seenEpoch[start] = epoch;
+    stack.push(start);
+    while (stack.length) {
+        const t = stack.pop();
+        bad.push(t);
+        const o = t * 3;
+        for (let e = 0; e < 3; e++) {
+            const nb = m.tn[o + e];
+            if (nb < 0 || m.seenEpoch[nb] === epoch)
+                continue;
+            const no = nb * 3;
+            if (inCircle(pts[m.tv[no]], pts[m.tv[no + 1]], pts[m.tv[no + 2]], P)) {
+                m.seenEpoch[nb] = epoch;
+                stack.push(nb);
+            }
+        }
+    }
+    // Cavity boundary edges (oriented so the cavity is to the left). The epoch stamp holds exactly
+    // the cavity set (start + every triangle whose circumcircle contained p) = the membership test.
+    for (const t of bad) {
+        const o = t * 3;
+        for (let e = 0; e < 3; e++) {
+            const nb = m.tn[o + e];
+            if (nb >= 0 && m.seenEpoch[nb] === epoch)
+                continue;
+            ea.push(m.tv[o + e]);
+            eb.push(m.tv[o + ((e + 1) % 3)]);
+            eext.push(nb);
+        }
+    }
+    // Recycle cavity slots; build a fan of new triangles (pi,a,b).
+    for (const t of bad)
+        m.kill(t);
+    const pe = ++s.epoch;
+    for (let i = 0; i < ea.length; i++) {
+        const a = ea[i], b = eb[i], ext = eext[i];
+        const idx = m.alloc(pi, a, b, -1, ext, -1);
+        setNeighbor(m, ext, a, b, idx);
+        s.startTri[a] = idx;
+        s.startStamp[a] = pe;
+        s.endTri[b] = idx;
+        s.endStamp[b] = pe;
+        made.push(idx);
+    }
+    for (const idx of made) {
+        const o = idx * 3;
+        const va = m.tv[o + 1], vb = m.tv[o + 2]; // v = [pi, a, b]
+        m.tn[o] = s.endStamp[va] === pe ? s.endTri[va] : -1; // edge (pi,a) shared with the tri ending at a
+        m.tn[o + 2] = s.startStamp[vb] === pe ? s.startTri[vb] : -1; // edge (b,pi) shared with the tri starting at b
+    }
+    return made[0] ?? start;
+}
+const edgeExists = (m, v2t, a, b) => (v2t[a] ?? []).some((ti) => { if (m.dead[ti])
+    return false; const o = ti * 3; return m.tv[o] === b || m.tv[o + 1] === b || m.tv[o + 2] === b; });
+function flipEdge(m, pts, ti, e) {
+    const oi = ti * 3;
+    const tj = m.tn[oi + e];
+    if (tj < 0)
+        return false;
+    const a = m.tv[oi + e], b = m.tv[oi + ((e + 1) % 3)], c = m.tv[oi + ((e + 2) % 3)];
+    const oj = tj * 3;
+    let j = -1;
+    for (let k = 0; k < 3; k++)
+        if (m.tv[oj + k] === b && m.tv[oj + ((k + 1) % 3)] === a) {
+            j = k;
+            break;
+        }
+    if (j < 0)
+        return false;
+    const d = m.tv[oj + ((j + 2) % 3)];
+    if (orient(pts[c], pts[a], pts[d]) <= 0 || orient(pts[c], pts[d], pts[b]) <= 0)
+        return false; // not convex
+    // Everything read above; the two slots are now rewritten IN PLACE (the old object store swapped
+    // in fresh objects — callers must not read a slot's pre-flip fields after a successful flip).
+    const nbc = m.tn[oi + ((e + 1) % 3)], nca = m.tn[oi + ((e + 2) % 3)], nad = m.tn[oj + ((j + 1) % 3)], ndb = m.tn[oj + ((j + 2) % 3)];
+    m.tv[oi] = c;
+    m.tv[oi + 1] = a;
+    m.tv[oi + 2] = d;
+    m.tn[oi] = nca;
+    m.tn[oi + 1] = nad;
+    m.tn[oi + 2] = tj;
+    m.tv[oj] = c;
+    m.tv[oj + 1] = d;
+    m.tv[oj + 2] = b;
+    m.tn[oj] = ti;
+    m.tn[oj + 1] = ndb;
+    m.tn[oj + 2] = nbc;
+    setNeighbor(m, nad, a, d, ti);
+    setNeighbor(m, nbc, b, c, tj);
+    return true;
+}
+function forceEdge(m, pts, v2t, a, b) {
+    const tryFlip = (ti, e) => {
+        // Capture the mate BEFORE flipping: flipEdge rewrites both slots in place. (The old object
+        // store replaced tris[ti], so the captured object's pre-flip n[e] was still readable — same
+        // value, now read explicitly.)
+        const tj = m.tn[ti * 3 + e];
+        if (!flipEdge(m, pts, ti, e))
+            return false;
+        // refresh incidence for the two changed triangles
+        if (ti >= 0) {
+            const o = ti * 3;
+            (v2t[m.tv[o]] ??= []).push(ti);
+            (v2t[m.tv[o + 1]] ??= []).push(ti);
+            (v2t[m.tv[o + 2]] ??= []).push(ti);
+        }
+        if (tj >= 0) {
+            const o = tj * 3;
+            (v2t[m.tv[o]] ??= []).push(tj);
+            (v2t[m.tv[o + 1]] ??= []).push(tj);
+            (v2t[m.tv[o + 2]] ??= []).push(tj);
+        }
+        return true;
+    };
+    /** Walk the corridor of triangles the segment a-b crosses (via neighbour links, valid during the
+     * flip pass) and flip the first flippable crossing edge. O(corridor) instead of O(all triangles).
+     * Returns false when the walk can't proceed (segment through a vertex, broken link) — caller
+     * falls back to the exhaustive scan for that iteration. */
+    const corridorFlip = () => {
+        for (const ti of v2t[a] ?? []) {
+            if (m.dead[ti])
+                continue;
+            const oi = ti * 3;
+            const k = m.tv[oi] === a ? 0 : m.tv[oi + 1] === a ? 1 : m.tv[oi + 2] === a ? 2 : -1;
+            if (k < 0)
+                continue;
+            const e = (k + 1) % 3; // edge opposite a
+            const u = m.tv[oi + e], w = m.tv[oi + ((e + 1) % 3)];
+            if (u === b || w === b)
+                continue;
+            if (!segCross(pts[a], pts[b], pts[u], pts[w]))
+                continue;
+            // found the corridor entrance; walk it, trying to flip each crossing edge
+            let cur = ti, edge = e;
+            for (let step = 0; step < 2000; step++) {
+                if (tryFlip(cur, edge))
+                    return true;
+                const oc = cur * 3;
+                const nx = m.tn[oc + edge];
+                if (nx < 0)
+                    return null;
+                if (m.dead[nx])
+                    return null;
+                const on = nx * 3;
+                // entry edge in nx is (w2,u2) reversed; segment exits through one of the other two edges
+                let advanced = false;
+                for (let e2 = 0; e2 < 3; e2++) {
+                    const u2 = m.tv[on + e2], w2 = m.tv[on + ((e2 + 1) % 3)];
+                    if (u2 === a || u2 === b || w2 === a || w2 === b)
+                        continue;
+                    const pk = ckey(u2, w2);
+                    if (pk === ckey(m.tv[oc + edge], m.tv[oc + ((edge + 1) % 3)]))
+                        continue; // entry edge
+                    if (segCross(pts[a], pts[b], pts[u2], pts[w2])) {
+                        cur = nx;
+                        edge = e2;
+                        advanced = true;
+                        break;
+                    }
+                }
+                if (!advanced)
+                    return false; // corridor ends (reached b's fan) with nothing flippable
+            }
+            return null;
+        }
+        return null; // no crossing edge incident to a (collinear pass-through) — needs the full scan
+    };
+    let guard = 0;
+    while (!edgeExists(m, v2t, a, b) && guard++ < 500) {
+        const cf = corridorFlip();
+        if (cf === true)
+            continue;
+        // corridor blocked or unwalkable: exhaustive scan — the old behaviour. Flipping a crossing
+        // edge anywhere (even outside the walked corridor) can unblock a non-convex quad, so the
+        // corridor is strictly an accelerator, never a reason to give up earlier than the scan did.
+        let flipped = false;
+        for (let ti = 0; ti < m.nt && !flipped; ti++) {
+            if (m.dead[ti])
+                continue;
+            const o = ti * 3;
+            for (let e = 0; e < 3; e++) {
+                const u = m.tv[o + e], w = m.tv[o + ((e + 1) % 3)];
+                if (u === a || u === b || w === a || w === b)
+                    continue;
+                if (segCross(pts[a], pts[b], pts[u], pts[w]) && tryFlip(ti, e)) {
+                    flipped = true;
+                    break;
+                }
+            }
+        }
+        if (!flipped)
+            break;
+    }
+}
+/** Ear-clip a simple polygon (vertex-index ring) into triangles, appended to `out`. */
+function earClip(pts, ring, out) {
+    const idx = ring.slice();
+    if (idx.length < 3)
+        return true;
+    let area = 0;
+    for (let i = 0; i < idx.length; i++) {
+        const p = pts[idx[i]], q = pts[idx[(i + 1) % idx.length]];
+        area += p[0] * q[1] - q[0] * p[1];
+    }
+    if (area < 0)
+        idx.reverse();
+    let guard = 0;
+    while (idx.length > 3 && guard++ < 100000) {
+        let clipped = false;
+        for (let i = 0; i < idx.length; i++) {
+            const a = idx[(i + idx.length - 1) % idx.length], b = idx[i], c = idx[(i + 1) % idx.length];
+            if (orient(pts[a], pts[b], pts[c]) <= 0)
+                continue; // reflex or degenerate — not an ear
+            let ok = true;
+            for (let j = 0; j < idx.length; j++) {
+                const p = idx[j];
+                if (p === a || p === b || p === c)
+                    continue;
+                if (pointInTri(pts[p], pts[a], pts[b], pts[c])) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok)
+                continue;
+            out.push([a, b, c]);
+            idx.splice(i, 1);
+            clipped = true;
+            break;
+        }
+        if (!clipped)
+            return false; // not a simple polygon — bail
+    }
+    if (idx.length === 3)
+        out.push([idx[0], idx[1], idx[2]]);
+    return true;
+}
+/**
+ * Watertight fallback when the CDT can't realise a face's boundary constraints: ear-clip the outer
+ * ring (every boundary edge guaranteed present => watertight with the neighbour), THEN re-insert the
+ * interior points so the patch still follows the surface instead of spanning flat chords across a
+ * curved boundary. Each interior point splits its containing triangle into three — the original three
+ * edges survive as triangle edges, so neighbours stay matched (no T-junctions for strictly-interior
+ * points; points that miss every triangle, e.g. just outside the trimmed region, are skipped).
+ * Returns null if the ring isn't a clean simple polygon (caller keeps its other fallback).
+ */
+function boundaryFillWithInterior(pts, ring, interior) {
+    const out = [];
+    if (!earClip(pts, ring, out) || out.length === 0)
+        return null;
+    // Point location: a linear scan of `out` per interior point is O(interior × triangles) and alone
+    // consumed ~95% of a whole-model profile (ABC 00015249: 480k interior points, 580 s). Locate
+    // instead via (a) a uniform grid over the INITIAL ear-clip triangles only — that set is static,
+    // so its long-fan triangles register their bbox cells exactly once — and (b) a history tree
+    // through the splits: each split records its three children, and a later point walks down by
+    // strict containment. Children tile their parent disjointly under the strict margin, so the
+    // located leaf is the unique strict container — the same triangle the linear first-match scan
+    // found. The `out` array itself is built exactly as before.
+    const na = [], nb = [], nc = [], oIdx = [];
+    const k0 = [], k1 = [], k2 = [];
+    const addNode = (a, b, c, outIdx) => {
+        na.push(a);
+        nb.push(b);
+        nc.push(c);
+        oIdx.push(outIdx);
+        k0.push(-1);
+        k1.push(-1);
+        k2.push(-1);
+        return na.length - 1;
+    };
+    const strictIn = (nd, p) => {
+        const A = pts[na[nd]], B = pts[nb[nd]], C = pts[nc[nd]];
+        const m = 1e-3 * Math.abs(orient(A, B, C));
+        return orient(A, B, p) > m && orient(B, C, p) > m && orient(C, A, p) > m;
+    };
+    // Descent test: OPEN containment, no margin. The strict margin scales with triangle area, so a
+    // point far inside a small leaf can still fail its large ANCESTOR's margin — descending on the
+    // strict test would drop points the linear scan accepted. Open interiors of siblings are
+    // disjoint and a leaf's interior nests inside every ancestor's, so the loose walk reaches the
+    // unique candidate leaf; the strict test then decides at the leaf exactly as the scan did.
+    const looseIn = (nd, p) => {
+        const A = pts[na[nd]], B = pts[nb[nd]], C = pts[nc[nd]];
+        return orient(A, B, p) > 0 && orient(B, C, p) > 0 && orient(C, A, p) > 0;
+    };
+    const initN = out.length;
+    let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+    for (const v of ring) {
+        const p = pts[v];
+        if (p[0] < minx)
+            minx = p[0];
+        if (p[0] > maxx)
+            maxx = p[0];
+        if (p[1] < miny)
+            miny = p[1];
+        if (p[1] > maxy)
+            maxy = p[1];
+    }
+    const gN = Math.max(1, Math.min(256, Math.ceil(Math.sqrt(initN))));
+    const gw = Math.max(maxx - minx, 1e-300) / gN, gh = Math.max(maxy - miny, 1e-300) / gN;
+    const gx = (x) => Math.min(gN - 1, Math.max(0, Math.floor((x - minx) / gw)));
+    const gy = (y) => Math.min(gN - 1, Math.max(0, Math.floor((y - miny) / gh)));
+    const cells = new Map();
+    for (let k = 0; k < initN; k++) {
+        addNode(out[k][0], out[k][1], out[k][2], k);
+        const A = pts[out[k][0]], B = pts[out[k][1]], C = pts[out[k][2]];
+        const x0 = gx(Math.min(A[0], B[0], C[0])), x1 = gx(Math.max(A[0], B[0], C[0]));
+        const y0 = gy(Math.min(A[1], B[1], C[1])), y1 = gy(Math.max(A[1], B[1], C[1]));
+        for (let ix = x0; ix <= x1; ix++)
+            for (let iy = y0; iy <= y1; iy++) {
+                const key = ix * gN + iy;
+                const arr = cells.get(key);
+                if (arr)
+                    arr.push(k);
+                else
+                    cells.set(key, [k]);
+            }
+    }
+    for (const pi of interior) {
+        const p = pts[pi];
+        // Split only the triangle that STRICTLY contains pi (a clear margin from every edge). A point on
+        // (or hugging) a shared edge would split one side only and leave a T-junction = non-manifold; such
+        // points are simply skipped, costing a little interior density, never watertightness.
+        // (min initial-node id = min out index = the linear scan's first match)
+        let nd = -1;
+        for (const k of cells.get(gx(p[0]) * gN + gy(p[1])) ?? []) {
+            if (nd >= 0 && k >= nd)
+                continue;
+            if (looseIn(k, p))
+                nd = k;
+        }
+        while (nd >= 0 && k0[nd] >= 0) {
+            nd = looseIn(k0[nd], p) ? k0[nd] : looseIn(k1[nd], p) ? k1[nd] : looseIn(k2[nd], p) ? k2[nd] : -1;
+        }
+        if (nd < 0 || !strictIn(nd, p))
+            continue;
+        const found = oIdx[nd];
+        const [a, b, c] = out[found];
+        out[found] = [a, b, pi];
+        out.push([b, c, pi], [c, a, pi]);
+        k0[nd] = addNode(a, b, pi, found);
+        k1[nd] = addNode(b, c, pi, out.length - 2);
+        k2[nd] = addNode(c, a, pi, out.length - 1);
+    }
+    return out;
+}
+/**
+ * Fan-triangulate a simple polygon from a single apex vertex (every triangle is apex-edge_i). Works
+ * — where ear-clipping fails — on a polygon that is geometrically a triangle with COLLINEAR points
+ * along one side: a ruled/curved slice meeting at a singular vertex (a cone apex or a sphere pole)
+ * plus a curved rim whose samples project collinear. Ear-clip can only clip the apex ear, leaving a
+ * degenerate collinear remainder; a fan from the apex makes every rim segment a triangle edge (hence
+ * watertight with the neighbour). Tries each vertex as the star centre and accepts the first whose
+ * fan is a valid, non-overlapping, area-exact tiling.
+ */
+function fanFill(pts, ring) {
+    const n = ring.length;
+    if (n < 3)
+        return null;
+    let polyArea = 0;
+    for (let i = 0; i < n; i++) {
+        const p = pts[ring[i]], q = pts[ring[(i + 1) % n]];
+        polyArea += p[0] * q[1] - q[0] * p[1];
+    }
+    polyArea = Math.abs(polyArea) / 2;
+    if (polyArea < 1e-12)
+        return null;
+    for (let c = 0; c < n; c++) {
+        const out = [];
+        let sumA = 0, ok = true;
+        for (let i = 0; i < n && ok; i++) {
+            const a = ring[i], b = ring[(i + 1) % n];
+            if (a === ring[c] || b === ring[c])
+                continue; // edge incident to the apex
+            const A = pts[ring[c]], B = pts[a], C = pts[b];
+            const ar = orient(A, B, C);
+            if (ar <= 1e-12) {
+                ok = false;
+                break;
+            } // reflex/degenerate from this centre -> not the kernel
+            for (let j = 0; j < n; j++) {
+                const vj = ring[j];
+                if (vj === ring[c] || vj === a || vj === b)
+                    continue;
+                if (pointInTri(pts[vj], A, B, C)) {
+                    ok = false;
+                    break;
+                }
+            }
+            sumA += ar / 2;
+            out.push([ring[c], a, b]);
+        }
+        if (ok && Math.abs(sumA - polyArea) < 1e-6 * polyArea)
+            return out;
+    }
+    return null;
+}
+/**
+ * Excise MICRO self-intersections from a boundary ring: projection noise where two rails of a
+ * slot/thread converge (run-outs) makes the ring cross itself in tiny zero-area loops, which makes
+ * every watertight fill refuse the ring — and a 15k-point dome then vanishes over a dozen bad
+ * points. A crossing whose two segments are ≤64 ring positions apart bounds a micro-loop: drop the
+ * short arc between them (the neighbour keeps those samples — a few T-junction points at the
+ * run-out, instead of the whole face missing). Genuine large-scale tangles (crossings far apart on
+ * the ring) are NOT repairable this way — return null so the caller keeps its other fallbacks.
+ */
+function dropMicroLoops(pts, ring) {
+    let cur = ring.slice();
+    const maxDrop = Math.max(16, Math.floor(ring.length * 0.1));
+    let dropped = 0;
+    const distPS = (p, a, b) => {
+        const ex = b[0] - a[0], ey = b[1] - a[1];
+        const l2 = ex * ex + ey * ey;
+        let t = l2 > 0 ? ((p[0] - a[0]) * ex + (p[1] - a[1]) * ey) / l2 : 0;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        return Math.hypot(p[0] - (a[0] + t * ex), p[1] - (a[1] + t * ey));
+    };
+    for (let pass = 0; pass < 32; pass++) {
+        const n = cur.length;
+        if (n < 4)
+            return null;
+        // spatial hash of segments (short segments -> few cells each)
+        let sum = 0;
+        for (let i = 0; i < n; i++) {
+            const a = pts[cur[i]], b = pts[cur[(i + 1) % n]];
+            sum += Math.hypot(b[0] - a[0], b[1] - a[1]);
+        }
+        const avgSeg = Math.max(sum / n, 1e-12);
+        const touchTol = 0.25 * avgSeg; // rails closer than a quarter sample-step = degenerate contact
+        const cell = avgSeg * 2;
+        const hk = (ix, iy) => Math.imul(ix, 73856093) ^ Math.imul(iy, 19349663);
+        const grid = new Map();
+        for (let i = 0; i < n; i++) {
+            const a = pts[cur[i]], b = pts[cur[(i + 1) % n]];
+            const x0 = Math.floor((Math.min(a[0], b[0]) - touchTol) / cell), x1 = Math.floor((Math.max(a[0], b[0]) + touchTol) / cell);
+            const y0 = Math.floor((Math.min(a[1], b[1]) - touchTol) / cell), y1 = Math.floor((Math.max(a[1], b[1]) + touchTol) / cell);
+            for (let x = x0; x <= x1; x++)
+                for (let y = y0; y <= y1; y++) {
+                    const k = hk(x, y);
+                    const arr = grid.get(k);
+                    if (arr)
+                        arr.push(i);
+                    else
+                        grid.set(k, [i]);
+                }
+        }
+        // Collect degenerate contacts: proper segment crossings AND rail segments passing within
+        // touchTol of each other (interleaved zero-width corridors block every ear without crossing).
+        const pairs = []; // [dcyc, i, j]
+        for (const arr of grid.values()) {
+            for (let ai = 0; ai < arr.length; ai++)
+                for (let bi = ai + 1; bi < arr.length; bi++) {
+                    let i = arr[ai], j = arr[bi];
+                    if (i > j) {
+                        const t = i;
+                        i = j;
+                        j = t;
+                    }
+                    const dIdx = Math.min(j - i, n - (j - i));
+                    if (dIdx <= 1)
+                        continue; // adjacent segments legitimately touch
+                    const a0 = pts[cur[i]], a1 = pts[cur[(i + 1) % n]];
+                    const b0 = pts[cur[j]], b1 = pts[cur[(j + 1) % n]];
+                    const touch = segCross(a0, a1, b0, b1)
+                        || distPS(b0, a0, a1) < touchTol || distPS(b1, a0, a1) < touchTol
+                        || distPS(a0, b0, b1) < touchTol || distPS(a1, b0, b1) < touchTol;
+                    if (touch)
+                        pairs.push([dIdx, i, j]);
+                }
+        }
+        if (!pairs.length) {
+            if (DBG)
+                console.error(`[cdt]   dropMicroLoops: clean after ${pass} passes, dropped=${dropped}/${ring.length}`);
+            return dropped > 0 ? cur : null; // simple now (or was never degenerate)
+        }
+        // Excise every non-overlapping small-span contact this pass (the short arc between the two
+        // segments = the micro-loop / zero-width tail). A long interleaved run-out is hundreds of
+        // touch points, so one-at-a-time never converges.
+        pairs.sort((a, b) => a[0] - b[0]);
+        const drop = new Uint8Array(n);
+        let any = false, tangle = false;
+        for (const [d, i, j] of pairs) {
+            if (d > 96) {
+                tangle = tangle || !any;
+                break;
+            } // spans this large are a genuine tangle
+            if (j - i !== d)
+                continue; // wrap-around short side: rare, let a later pass handle it solo
+            if (dropped + d > maxDrop)
+                break;
+            let clear = drop[i] === 0 && drop[(j + 1) % n] === 0;
+            for (let k = i + 1; clear && k <= j; k++)
+                clear = drop[k] === 0;
+            if (!clear)
+                continue;
+            for (let k = i + 1; k <= j; k++)
+                drop[k] = 1;
+            dropped += d;
+            any = true;
+        }
+        if (!any) {
+            // nothing excisable: either all contacts are huge (tangle) or budget is spent
+            if (DBG)
+                console.error(`[cdt]   dropMicroLoops: ${tangle ? "large-span contact — genuine tangle" : `budget spent (dropped=${dropped})`}, contacts=${pairs.length}`);
+            return null;
+        }
+        cur = cur.filter((_, k) => drop[k] === 0);
+    }
+    if (DBG)
+        console.error(`[cdt]   dropMicroLoops: pass budget exhausted, dropped=${dropped}`);
+    return null;
+}
+/**
+ * Robustly enforce constraint edge a-b when flips couldn't: delete every triangle the segment
+ * crosses, then ear-clip the two simple sub-polygons that the segment splits the cavity into.
+ * Returns false (leaving the triangulation unchanged) if the cavity isn't a clean single loop.
+ */
+function enforceByRetriangulation(m, pts, a, b, constraints) {
+    const PA = pts[a], PB = pts[b];
+    const crossed = [];
+    for (let t = 0; t < m.nt; t++) {
+        if (m.dead[t])
+            continue;
+        const o = t * 3;
+        for (let e = 0; e < 3; e++) {
+            const u = m.tv[o + e], w = m.tv[o + ((e + 1) % 3)];
+            if (u === a || u === b || w === a || w === b)
+                continue;
+            if (segCross(PA, PB, pts[u], pts[w])) {
+                crossed.push(t);
+                break;
+            }
+        }
+    }
+    if (!crossed.length || crossed.length > 64) {
+        if (DBG)
+            console.error(`[cdt]     enforce ${a}-${b}: bail crossed=${crossed.length}${process.env.MESHSTEP_SLICEDBG ? ` A=(${PA[0]},${PA[1]}) B=(${PB[0]},${PB[1]})` : ""}`);
+        return false; // huge/empty cavity = degenerate seam — leave it
+    }
+    // Boundary edges of the cavity = edges of crossed triangles not shared by two crossed triangles.
+    const count = new Map();
+    for (const t of crossed) {
+        const o = t * 3;
+        for (let e = 0; e < 3; e++) {
+            const k = ckey(m.tv[o + e], m.tv[o + ((e + 1) % 3)]);
+            count.set(k, (count.get(k) ?? 0) + 1);
+        }
+    }
+    // CONSTRAINT PROTECTION: an edge interior to the cavity (shared by two crossed triangles) is
+    // deleted with them, and a free ear-clip fill has no obligation to recreate it. When the segment
+    // squeezes past a shared boundary vertex, such an interior edge can be a NEIGHBOURING constraint
+    // the flip pass already realised — enforcing a-b would silently destroy it (the wio-front/letters
+    // open-edge class; both a fixpoint re-enforcement and a chain-split repair of the aftermath
+    // REGRESSED — see the note above constrainedTriangulate's second pass). Enforce the invariant at
+    // the source: such an edge becomes a MANDATORY DIAGONAL of the fill (the cavity polygon is split
+    // at it and each side clipped separately), so a-b and the neighbour are BOTH realised. It cannot
+    // cross a-b (an interior edge crossed by the segment is a genuine constraint-vs-constraint
+    // conflict) — there, refuse and leave a-b to the face-level rescue.
+    const chords = [];
+    for (const [k, c] of count) {
+        if (c === 2 && constraints.has(k)) {
+            const u = Math.floor(k / 0x8000000), w = k % 0x8000000;
+            if (segCross(PA, PB, pts[u], pts[w])) {
+                // T-CONFIGURATION REPAIR: when the "crossing" is one of OUR OWN endpoints sitting on the
+                // realised constraint's line within fp noise (a rim vertex projected 1e-16 off the seam
+                // meridian it belongs to — ABC 00000452's weaving muzzle rim), the two constraints
+                // mutually block and one is always lost. The split is exact: replace u-w with u-x + x-w
+                // through our endpoint x — geometrically the same edge — and make both pieces mandatory
+                // diagonals of the fill. The pieces join the constraints set mid-iteration, so the outer
+                // enforcement loop visits and (if needed) enforces them after this call.
+                const U = pts[u], W = pts[w];
+                const ex = W[0] - U[0], ey = W[1] - U[1];
+                const L = Math.hypot(ex, ey) || 1;
+                const lineDist = (P) => Math.abs((P[0] - U[0]) * ey - (P[1] - U[1]) * ex) / L;
+                const eps = 1e-9 * L;
+                const x = lineDist(PA) <= eps ? a : lineDist(PB) <= eps ? b : -1;
+                if (x >= 0 && x !== u && x !== w) {
+                    constraints.delete(k);
+                    constraints.add(ckey(u, x));
+                    constraints.add(ckey(x, w));
+                    chords.push([u, x], [x, w]);
+                    if (DBG)
+                        console.error(`[cdt]     enforce ${a}-${b}: split realised constraint ${u}-${w} at endpoint ${x} (T-configuration)`);
+                    continue;
+                }
+                if (DBG)
+                    console.error(`[cdt]     enforce ${a}-${b}: bail crosses realised constraint ${u}-${w}${process.env.MESHSTEP_SLICEDBG ? ` A=(${PA[0]},${PA[1]}) B=(${PB[0]},${PB[1]}) U=(${pts[u][0]},${pts[u][1]}) W=(${pts[w][0]},${pts[w][1]})` : ""}`);
+                return false;
+            }
+            chords.push([u, w]);
+        }
+    }
+    const nextOf = new Map();
+    let edges = 0;
+    for (const t of crossed) {
+        const o = t * 3;
+        for (let e = 0; e < 3; e++) {
+            const u = m.tv[o + e], w = m.tv[o + ((e + 1) % 3)];
+            if ((count.get(ckey(u, w)) ?? 0) === 1) {
+                if (nextOf.has(u)) {
+                    if (DBG)
+                        console.error(`[cdt]     enforce ${a}-${b}: bail cavity-fork at v${u}`);
+                    return false;
+                }
+                nextOf.set(u, w);
+                edges++;
+            }
+        }
+    }
+    const sdbg = DBG && !!process.env.MESHSTEP_SLICEDBG;
+    if (!nextOf.has(a) || !nextOf.has(b)) {
+        if (sdbg)
+            console.error(`[cdt]     enforce ${a}-${b}: bail endpoint not on cavity boundary`);
+        return false;
+    }
+    const loop = [];
+    let cur = a;
+    for (let g = 0; g <= edges; g++) {
+        loop.push(cur);
+        const nx = nextOf.get(cur);
+        if (nx === undefined) {
+            if (sdbg)
+                console.error(`[cdt]     enforce ${a}-${b}: bail cavity chain break at v${cur}`);
+            return false;
+        }
+        cur = nx;
+        if (cur === a)
+            break;
+    }
+    if (cur !== a || loop.length !== edges) {
+        if (sdbg)
+            console.error(`[cdt]     enforce ${a}-${b}: bail cavity not one loop (${loop.length}/${edges})`);
+        return false;
+    } // not one simple loop
+    const ia = loop.indexOf(a), ib = loop.indexOf(b);
+    let path1 = [], path2 = [];
+    for (let i = ia;; i = (i + 1) % loop.length) {
+        path1.push(loop[i]);
+        if (i === ib)
+            break;
+    }
+    for (let i = ib;; i = (i + 1) % loop.length) {
+        path2.push(loop[i]);
+        if (i === ia)
+            break;
+    }
+    // A slit boundary legitimately visits one (u,v) point twice (out-and-back legs, coincident by
+    // design — see slitCollapse). When both copies land on this cavity's walk they are ADJACENT
+    // coincident vertices, and no ear survives: the duplicate sits exactly ON every candidate ear's
+    // vertex (Z Bearing Block's sphere: the ring-at-slit-tip pair walks into the cavity of a
+    // boundary constraint two edges away). Coincident neighbours are one point — clip through one
+    // representative; the 3D weld unifies them again downstream.
+    const dedupAdjacent = (path) => {
+        const outp = [];
+        for (const v of path) {
+            const prev = outp[outp.length - 1];
+            if (prev !== undefined && pts[prev][0] === pts[v][0] && pts[prev][1] === pts[v][1])
+                continue;
+            outp.push(v);
+        }
+        return outp;
+    };
+    path1 = dedupAdjacent(path1);
+    path2 = dedupAdjacent(path2);
+    const newTris = [];
+    // Clip each side with the protected constraints as mandatory diagonals: split the polygon at the
+    // chord and clip the two sub-polygons, so the chord edge is guaranteed present in the fill. A
+    // chord not in this path (endpoints on the other side of a-b) is simply skipped by the index test.
+    const clipWithChords = (path, rem) => {
+        for (let ci = 0; ci < rem.length; ci++) {
+            const [u, w] = rem[ci];
+            const iu = path.indexOf(u), iw = path.indexOf(w);
+            if (iu < 0 || iw < 0)
+                continue;
+            const [i, j] = iu < iw ? [iu, iw] : [iw, iu];
+            if (j - i === 1 || (i === 0 && j === path.length - 1))
+                continue; // already a polygon side
+            const rest = rem.slice(0, ci).concat(rem.slice(ci + 1));
+            return clipWithChords(path.slice(i, j + 1), rest)
+                && clipWithChords([...path.slice(j), ...path.slice(0, i + 1)], rest);
+        }
+        return earClip(pts, path, newTris);
+    };
+    if (!clipWithChords(path1, chords) || !clipWithChords(path2, chords)) {
+        if (sdbg)
+            console.error(`[cdt]     enforce ${a}-${b}: bail ear-clip failed (paths ${path1.length}/${path2.length})`);
+        return false;
+    }
+    // Area-conservation guard: the fill must tile exactly the deleted cavity. If areas disagree the
+    // cavity loop was self-folded (a degenerate periodic seam) — abort rather than corrupt the mesh.
+    const triArea = (x, y, z) => Math.abs(orient(pts[x], pts[y], pts[z]));
+    let oldA = 0;
+    for (const t of crossed) {
+        const o = t * 3;
+        oldA += triArea(m.tv[o], m.tv[o + 1], m.tv[o + 2]);
+    }
+    let newA = 0;
+    for (const [x, y, z] of newTris)
+        newA += triArea(x, y, z);
+    if (Math.abs(newA - oldA) > 1e-3 * (oldA + 1e-12)) {
+        if (sdbg)
+            console.error(`[cdt]     enforce ${a}-${b}: bail area mismatch old=${oldA} new=${newA}`);
+        return false;
+    }
+    for (const t of crossed)
+        m.kill(t);
+    // Neighbour links intentionally left broken (-1): the flood fill rebuilds adjacency fresh.
+    for (const [x, y, z] of newTris)
+        m.alloc(x, y, z, -1, -1, -1);
+    return true;
+}
+/**
+ * Triangulate the region bounded by loops[0] (outer) minus loops[1..] (holes), using all listed
+ * points (loop vertices + interior). Returns triangle index triples into `points`.
+ */
+export function constrainedTriangulate(points, loops, interior, out) {
+    const n = points.length;
+    // Reset BOTH out fields: callers reuse one out object across refinement re-runs, and a stale
+    // rescue label from a previous run would mis-flag a clean triangulation.
+    if (out) {
+        out.missing = 0;
+        out.rescue = undefined;
+    }
+    if (n < 3)
+        return [];
+    let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+    for (const p of points) {
+        if (p[0] < minx)
+            minx = p[0];
+        if (p[1] < miny)
+            miny = p[1];
+        if (p[0] > maxx)
+            maxx = p[0];
+        if (p[1] > maxy)
+            maxy = p[1];
+    }
+    const dmax = Math.max(maxx - minx, maxy - miny) || 1;
+    const cx = (minx + maxx) / 2, cy = (miny + maxy) / 2;
+    const pts = points.slice();
+    // Super-triangle in CCW order (all predicates assume CCW).
+    const s0 = pts.length;
+    pts.push([cx - 3 * dmax, cy - dmax]); // bottom-left
+    const s1 = pts.length;
+    pts.push([cx + 3 * dmax, cy - dmax]); // bottom-right
+    const s2 = pts.length;
+    pts.push([cx, cy + 3 * dmax]); // top
+    // ~2n+ triangles for n points; sized up front so growth is rare.
+    const m = new Cdt(2 * n + 64);
+    m.alloc(s0, s1, s2, -1, -1, -1);
+    const scratch = {
+        bad: [], stack: [], made: [], ea: [], eb: [], eext: [],
+        startTri: new Int32Array(pts.length), startStamp: new Uint32Array(pts.length),
+        endTri: new Int32Array(pts.length), endStamp: new Uint32Array(pts.length), epoch: 0,
+    };
+    let hint = 0;
+    const dbgT0 = DBG ? Date.now() : 0;
+    // Insert boundary loop points first, then interior points. Each point index at most ONCE: a
+    // tangent-pinch loop legitimately lists the same index twice (weldPinches aliases the second
+    // visit), and re-inserting a vertex already in the triangulation splits a triangle incident to
+    // ITSELF — a degenerate (v,x,v) triangle that surfaces as a non-manifold edge plus a ring of
+    // open edges at the pinch (ABC 00013472 family: notched cylinder flaps meeting the rim row at
+    // a point).
+    const insertedPt = new Uint8Array(pts.length);
+    for (const loop of loops)
+        for (const pi of loop) {
+            if (insertedPt[pi])
+                continue;
+            insertedPt[pi] = 1;
+            hint = insertPoint(m, pts, pi, hint, scratch);
+        }
+    for (const pi of interior) {
+        if (insertedPt[pi])
+            continue;
+        insertedPt[pi] = 1;
+        hint = insertPoint(m, pts, pi, hint, scratch);
+    }
+    const dbgT1 = DBG ? Date.now() : 0;
+    // Force the constraint (boundary) edges.
+    const v2t = Array.from({ length: pts.length }, () => []);
+    for (let i = 0; i < m.nt; i++) {
+        if (m.dead[i])
+            continue;
+        const o = i * 3;
+        v2t[m.tv[o]].push(i);
+        v2t[m.tv[o + 1]].push(i);
+        v2t[m.tv[o + 2]].push(i);
+    }
+    const constraints = new Set();
+    for (const loop of loops)
+        for (let i = 0; i < loop.length; i++) {
+            const a = loop[i], b = loop[(i + 1) % loop.length];
+            constraints.add(ckey(a, b));
+            forceEdge(m, pts, v2t, a, b);
+        }
+    const dbgT2 = DBG ? Date.now() : 0;
+    // Second pass: any constraint the flip method left unrealised (stuck on non-convex quads) is
+    // enforced by deleting the crossed triangles and ear-clipping the cavity. (A fixpoint iteration
+    // of this pass was tried and REGRESSED: re-forcing hopeless constraints churns the triangulation
+    // and trips fold audits on other faces — one pass, like it always was.)
+    const present = new Set();
+    for (let t = 0; t < m.nt; t++) {
+        if (m.dead[t])
+            continue;
+        const o = t * 3;
+        for (let e = 0; e < 3; e++)
+            present.add(ckey(m.tv[o + e], m.tv[o + ((e + 1) % 3)]));
+    }
+    // COLLINEAR PASS-THROUGH: a vertex sitting exactly ON a constraint blocks it — no edge can cross
+    // a vertex, so the flip pass finds nothing to flip (crossed=0) and the cavity rescue has no
+    // cavity. When the triangulation already contains the full chain of edges a→X…→b along the
+    // segment, the constraint IS realised by its collinear pieces: swap it for the pieces in the
+    // constraints set, so the parity flood treats them as boundary and the missing count stays
+    // honest (Pool_Nozzle's cone rim: an out-and-back boundary revisits the rim row and parks a
+    // vertex exactly on another rim segment).
+    const chainSplit = (ck) => {
+        const a = Math.floor(ck / 0x8000000), b = ck % 0x8000000;
+        const A = pts[a], B = pts[b];
+        const abx = B[0] - A[0], aby = B[1] - A[1];
+        const len2 = abx * abx + aby * aby;
+        if (len2 < 1e-30)
+            return false;
+        // Duplicate-vertex equivalence first: an out-and-back boundary visits the same (u,v) twice
+        // with two point indices; the CDT realises the edge between ONE pairing of the duplicates and
+        // the constraint references the other. A geometrically-identical realised edge counts.
+        const eps2 = 1e-18 * len2;
+        const eqOf = (i) => {
+            const Q = pts[i];
+            const out = [i];
+            for (let v = 0; v < pts.length; v++) {
+                if (v === i)
+                    continue;
+                const P = pts[v];
+                const dx = P[0] - Q[0], dy = P[1] - Q[1];
+                if (dx * dx + dy * dy <= eps2)
+                    out.push(v);
+            }
+            return out;
+        };
+        const Ea = eqOf(a), Eb = eqOf(b);
+        if (Ea.length > 1 || Eb.length > 1) {
+            for (const va of Ea) {
+                for (const vb of Eb) {
+                    const k2 = ckey(va, vb);
+                    if (k2 !== ck && present.has(k2)) {
+                        if (DBG && process.env.MESHSTEP_SLICEDBG)
+                            console.error(`[cdt]     chainSplit ${a}-${b}: realised by duplicate pair ${va}-${vb}`);
+                        constraints.add(k2);
+                        constraints.delete(ck);
+                        return true;
+                    }
+                }
+            }
+        }
+        const mid = [];
+        for (let v = 0; v < pts.length; v++) {
+            if (v === a || v === b)
+                continue;
+            const P = pts[v];
+            const t = ((P[0] - A[0]) * abx + (P[1] - A[1]) * aby) / len2;
+            if (t <= 1e-9 || t >= 1 - 1e-9)
+                continue;
+            const dx = P[0] - (A[0] + t * abx), dy = P[1] - (A[1] + t * aby);
+            if (dx * dx + dy * dy > eps2)
+                continue;
+            mid.push({ t, v });
+        }
+        if (!mid.length)
+            return false;
+        mid.sort((p, q) => p.t - q.t);
+        const chain = [a, ...mid.map((m) => m.v), b];
+        for (let i = 0; i + 1 < chain.length; i++) {
+            if (!present.has(ckey(chain[i], chain[i + 1]))) {
+                if (DBG && process.env.MESHSTEP_SLICEDBG)
+                    console.error(`[cdt]     chainSplit ${a}-${b}: piece ${chain[i]}-${chain[i + 1]} absent`);
+                return false;
+            }
+        }
+        for (let i = 0; i + 1 < chain.length; i++)
+            constraints.add(ckey(chain[i], chain[i + 1]));
+        constraints.delete(ck);
+        return true;
+    };
+    let unrealized = 0, chainRealized = 0;
+    for (const ck of constraints)
+        if (!present.has(ck))
+            unrealized++;
+    // Cavity enforcement is a repair for a FEW stuck constraints (non-convex quads the flip pass
+    // couldn't turn). A boundary whose lift is systemically degenerate (a collapsed param domain)
+    // arrives with HUNDREDS of unrealisable constraints, every attempt pays a full O(triangles)
+    // crossed-scan plus two O(points) chainSplit scans, and even the attempts that "succeed" cannot
+    // save the face — ABC 00011952 spent 90 s repairing 450 of 1,134 unrealised constraints on a
+    // 628k-point CDT and still ended 687 missing (face untriangulated regardless). When a large
+    // absolute AND relative share of the boundary failed the flip pass, skip enforcement wholesale
+    // and let the missing count route the face to its rescue. Healthy repair cases are single
+    // digits; the streak backstop below cuts off the long-tail in between.
+    const bulkDegenerate = unrealized > 64 && unrealized > 0.25 * constraints.size;
+    if (!bulkDegenerate) {
+        // Consecutive-failure streak: after enough attempts fail in a row with not one success, the
+        // rest are lost causes too. Any success resets the streak, so a large-but-repairable
+        // boundary is never cut off.
+        let failStreak = 0;
+        for (const ck of constraints) {
+            if (present.has(ck))
+                continue;
+            if (failStreak >= 48)
+                continue;
+            const a = Math.floor(ck / 0x8000000), b = ck % 0x8000000;
+            // Cavity enforcement first — it realises the constraint EXACTLY whenever a cavity exists.
+            // Only when it can't (crossed=0: nothing to flip, no cavity to fill) fall back to accepting
+            // a geometrically-identical realisation (duplicate pair / collinear chain).
+            if (enforceByRetriangulation(m, pts, a, b, constraints))
+                failStreak = 0;
+            else if (chainSplit(ck)) {
+                chainRealized++;
+                failStreak = 0;
+            }
+            else
+                failStreak++;
+        }
+    }
+    else if (DBG) {
+        console.error(`[cdt] enforcement skipped: ${unrealized}/${constraints.size} constraints unrealised after flips — systemically degenerate boundary`);
+    }
+    if (DBG && Date.now() - dbgT0 > 500) {
+        console.error(`[cdt] SLOW n=${n} constraints=${constraints.size} unrealized=${unrealized}: insert=${dbgT1 - dbgT0}ms force=${dbgT2 - dbgT1}ms enforce=${Date.now() - dbgT2}ms`);
+    }
+    // Region extraction: flood fill from a super-triangle (outside), toggling in/out at constraints.
+    // Build edge adjacency FRESH from the live triangles — the per-triangle `n` links get mangled by
+    // constraint flipping, and trusting them leaves unreachable interior triangles (holes).
+    const edgeTris = new Map();
+    for (let i = 0; i < m.nt; i++) {
+        if (m.dead[i])
+            continue;
+        const o = i * 3;
+        for (let e = 0; e < 3; e++) {
+            const k = ckey(m.tv[o + e], m.tv[o + ((e + 1) % 3)]);
+            const a = edgeTris.get(k);
+            if (a)
+                a.push(i);
+            else
+                edgeTris.set(k, [i]);
+        }
+    }
+    // 1 = outside, 2 = inside, 0 = unseen. Head-index BFS: q.shift() moves the whole queue per pop
+    // (quadratic on big faces); the head pointer visits in the identical order for free.
+    const inside = new Int8Array(m.nt);
+    let startT = -1;
+    for (let i = 0; i < m.nt; i++) {
+        if (m.dead[i])
+            continue;
+        const o = i * 3;
+        if (m.tv[o] >= n || m.tv[o + 1] >= n || m.tv[o + 2] >= n) {
+            startT = i;
+            break;
+        }
+    }
+    if (startT < 0)
+        return [];
+    const q = [startT];
+    inside[startT] = 1;
+    for (let head = 0; head < q.length; head++) {
+        const t = q[head];
+        const st = inside[t] === 2;
+        const o = t * 3;
+        for (let e = 0; e < 3; e++) {
+            const k = ckey(m.tv[o + e], m.tv[o + ((e + 1) % 3)]);
+            const isC = constraints.has(k);
+            for (const nb of edgeTris.get(k) ?? []) {
+                if (nb === t || inside[nb])
+                    continue;
+                inside[nb] = (isC ? !st : st) ? 2 : 1;
+                q.push(nb);
+            }
+        }
+    }
+    const flood = [];
+    for (let i = 0; i < m.nt; i++) {
+        if (m.dead[i])
+            continue;
+        const o = i * 3;
+        const va = m.tv[o], vb = m.tv[o + 1], vc = m.tv[o + 2];
+        if (va >= n || vb >= n || vc >= n)
+            continue;
+        if (inside[i] === 2)
+            flood.push([va, vb, vc]);
+    }
+    // Count boundary constraints the CDT couldn't realise. When every constraint is present the parity
+    // flood fill is exact, so we keep it untouched (the common case for every well-parametrised face).
+    // (over the constraints set, not the raw loops: a chain-split constraint is realised by its
+    // collinear pieces and must not count as missing)
+    let missing = 0;
+    for (const ck of constraints)
+        if (!edgeTris.has(ck))
+            missing++;
+    if (out)
+        out.missing = missing;
+    if (DBG && missing > 0)
+        console.error(`[cdt] missing=${missing}/${constraints.size} pts=${n} loops=[${loops.map((l) => l.length).join(",")}] interior=${interior.length} flood=${flood.length}`);
+    if (DBG && process.env.MESHSTEP_SLICEDBG && missing > 0) {
+        for (const ck of constraints) {
+            if (edgeTris.has(ck))
+                continue;
+            const a = Math.floor(ck / 0x8000000), b = ck % 0x8000000;
+            const A = points[a], B = points[b];
+            console.error(`[cdt]   STILL-MISSING ${a}-${b}: A=(${A[0]},${A[1]}) B=(${B[0]},${B[1]})`);
+            const ex = B[0] - A[0], ey = B[1] - A[1], l2 = ex * ex + ey * ey;
+            for (let v = 0; v < n; v++) {
+                if (v === a || v === b)
+                    continue;
+                const P = points[v];
+                const t = l2 > 0 ? ((P[0] - A[0]) * ex + (P[1] - A[1]) * ey) / l2 : 0;
+                const dx = P[0] - (A[0] + t * ex), dy = P[1] - (A[1] + t * ey);
+                const d = Math.hypot(dx, dy);
+                if (d < 1e-5 * Math.sqrt(l2) && t > -0.5 && t < 1.5) {
+                    console.error(`[cdt]     near-line v${v}: (${P[0]},${P[1]}) t=${t.toFixed(6)} d=${d.toExponential(2)}`);
+                }
+            }
+            for (let t = 0; t < m.nt; t++) {
+                if (m.dead[t])
+                    continue;
+                const o = t * 3;
+                const vs = [m.tv[o], m.tv[o + 1], m.tv[o + 2]];
+                if (!vs.includes(a) && !vs.includes(b))
+                    continue;
+                console.error(`[cdt]     tri ${t}: ${vs.map((v) => `${v}${v >= n ? "S" : ""}=(${pts[v][0].toFixed(4)},${pts[v][1].toFixed(4)})`).join(" ")}`);
+            }
+        }
+    }
+    if (missing === 0) {
+        if (chainRealized === 0 || loops.length !== 1)
+            return flood;
+        // Constraints realised only by EQUIVALENCE (duplicate pair / collinear chain): the parity flood
+        // can still classify the region wrongly around the duplicated vertices — but the single-loop
+        // rescue can be wrong the OTHER way (it fills the out-and-back spike as a notch). Neither rule
+        // wins at every tolerance (Pool_Nozzle: flood correct at 0.002mm absolute, rescue correct at
+        // corpus-relative). Judge by OUTCOME: count coverage defects — a boundary segment covered ≠ 1×,
+        // any other edge covered ≠ 2× or once — and keep the cleaner candidate (flood wins ties).
+        const raw = new Set();
+        for (const loop of loops)
+            for (let i = 0; i < loop.length; i++)
+                raw.add(ckey(loop[i], loop[(i + 1) % loop.length]));
+        const defects = (cand) => {
+            const fe = new Map();
+            const feAdd = (x, y) => { const k = ckey(x, y); fe.set(k, (fe.get(k) ?? 0) + 1); };
+            for (const [a, b, c] of cand) {
+                feAdd(a, b);
+                feAdd(b, c);
+                feAdd(c, a);
+            }
+            let bad = 0;
+            for (const [k, cnt] of fe) {
+                const isB = raw.has(k) || constraints.has(k);
+                if (cnt === 1) {
+                    if (!isB)
+                        bad++;
+                }
+                else if (cnt === 2) {
+                    if (isB)
+                        bad++;
+                }
+                else
+                    bad += cnt - 2;
+            }
+            return bad;
+        };
+        let alt = boundaryFillWithInterior(points, loops[0], interior);
+        if (!alt || alt.length === 0) {
+            const simplified = dropMicroLoops(points, loops[0]);
+            if (simplified)
+                alt = boundaryFillWithInterior(points, simplified, interior);
+        }
+        if (!alt || alt.length === 0)
+            alt = fanFill(points, loops[0]);
+        // Geometric (centroid-in-polygon) classification is the third candidate — it was the winning
+        // path for these rings before equivalence-realisation existed (missing>0 used to fall through
+        // to it), and pnpoly is immune to the duplicated vertices that mislead the parity flood.
+        const outerPoly0 = loops[0].map((i) => points[i]);
+        const geom0 = [];
+        for (let i = 0; i < m.nt; i++) {
+            if (m.dead[i])
+                continue;
+            const o = i * 3;
+            const va = m.tv[o], vb = m.tv[o + 1], vc = m.tv[o + 2];
+            if (va >= n || vb >= n || vc >= n)
+                continue;
+            const cxp = (points[va][0] + points[vb][0] + points[vc][0]) / 3;
+            const cyp = (points[va][1] + points[vb][1] + points[vc][1]) / 3;
+            if (pnpoly(cxp, cyp, outerPoly0))
+                geom0.push([va, vb, vc]);
+        }
+        let best = flood, dBest = defects(flood), label = "flood";
+        for (const [name, cand] of [["rescue", alt], ["geom", geom0]]) {
+            if (!cand || cand.length === 0)
+                continue;
+            const d = defects(cand);
+            if (d < dBest) {
+                best = cand;
+                dBest = d;
+                label = name;
+            }
+        }
+        if (DBG)
+            console.error(`[cdt]   equivalence-realised: flood=${defects(flood)} rescue=${alt ? defects(alt) : "-"} geom=${defects(geom0)} -> ${label}`);
+        // The parity flood was NOT trusted here — report which rescue produced the region so the
+        // caller can surface a diagnostics warning (missing stays 0 on this path).
+        if (out && label !== "flood")
+            out.rescue = label;
+        return best;
+    }
+    // Constraints unrealised — the (u,v) embedding collapsed (a thin-sliver B-spline parameter domain
+    // where distinct 3D points coincide / fall collinear, so the CDT triangulated across the boundary
+    // and shattered the face internally). For a single loop with no holes, discard the CDT result and
+    // re-triangulate from the boundary ring directly (ear-clip + interior re-insertion): this
+    // guarantees every boundary edge is a triangle edge — hence watertight with the neighbour, which
+    // shares those exact samples — while still following the surface through the interior points.
+    // Falls through to the geometric classification if the ring isn't a clean simple polygon.
+    if (loops.length === 1 && (loops[0]?.length ?? 0) >= 3) {
+        let filled = boundaryFillWithInterior(points, loops[0], interior);
+        if (DBG)
+            console.error(`[cdt]   boundaryFillWithInterior: ${filled ? `${filled.length} tris` : "FAILED (ring not simple)"}`);
+        if (!filled || filled.length === 0) {
+            // Ring not simple — often micro self-crossings at slot/thread run-outs. Excise them and retry.
+            const simplified = dropMicroLoops(points, loops[0]);
+            if (simplified) {
+                filled = boundaryFillWithInterior(points, simplified, interior);
+                if (DBG)
+                    console.error(`[cdt]   dropMicroLoops(${loops[0].length}->${simplified.length}) + refill: ${filled ? `${filled.length} tris` : "still FAILED"}`);
+            }
+        }
+        if (filled && filled.length > 0)
+            return filled;
+        // Ear-clip failed — the loop is a triangle with a collinear side (a curved slice meeting at a
+        // cone apex / sphere pole). Fan from the apex, making every rim segment a triangle edge.
+        const fan = fanFill(points, loops[0]);
+        if (DBG)
+            console.error(`[cdt]   fanFill: ${fan ? `${fan.length} tris` : "FAILED"}`);
+        if (fan && fan.length > 0)
+            return fan;
+    }
+    // Some seam edge is unrealisable — a metric-collapsed boundary on a skewed B-spline patch. The
+    // flood fill leaks through that gap and flips a whole connected region to "outside", opening half
+    // the face's seam (one unenforced edge => hundreds of open edges). A GEOMETRIC classification
+    // (centroid inside outer, outside holes) can't be leaked: a miss costs at most one triangle. But on
+    // a boundary that genuinely self-intersects in scaled (u,v) — a closed-v B-spline patch whose seam
+    // unwrap tangled the loop — there is NO non-overlapping triangulation of that polygon: keeping
+    // either the flood or the geometric fill leaves a knot of double-covered (non-manifold) triangles.
+    // That chaos reads worse than a clean hole, so emit NOTHING and let the face be a small gap.
+    const outerLoop = loops[0] ?? [];
+    let selfCross = false;
+    for (let i = 0; i < outerLoop.length && !selfCross; i++) {
+        const a0 = points[outerLoop[i]], a1 = points[outerLoop[(i + 1) % outerLoop.length]];
+        for (let j = i + 2; j < outerLoop.length; j++) {
+            if (i === 0 && j === outerLoop.length - 1)
+                continue; // shares the closing vertex
+            const b0 = points[outerLoop[j]], b1 = points[outerLoop[(j + 1) % outerLoop.length]];
+            if (segCross(a0, a1, b0, b1)) {
+                selfCross = true;
+                break;
+            }
+        }
+    }
+    if (DBG)
+        console.error(`[cdt]   selfCross=${selfCross} -> ${selfCross ? "flood-or-nothing" : "geometric classification"}`);
+    if (selfCross) {
+        // If the flood fill itself is manifold, keep it — a benign self-cross. Only when it double-covers
+        // (an edge shared by >2 triangles, i.e. an unavoidable knot on a tangled closed-v seam) is the
+        // chaos worse than a clean hole, so emit nothing for those.
+        const fe = new Map();
+        const feAdd = (x, y) => { const k = ckey(x, y); fe.set(k, (fe.get(k) ?? 0) + 1); };
+        for (const [a, b, cc] of flood) {
+            feAdd(a, b);
+            feAdd(b, cc);
+            feAdd(cc, a);
+        }
+        let floodNm = 0;
+        for (const v of fe.values())
+            if (v > 2)
+                floodNm++;
+        return floodNm > 0 ? [] : flood;
+    }
+    const outerPoly = outerLoop.map((i) => points[i]);
+    const holePolys = loops.slice(1).map((l) => l.map((i) => points[i]));
+    const geom = [];
+    for (let i = 0; i < m.nt; i++) {
+        if (m.dead[i])
+            continue;
+        const o = i * 3;
+        const va = m.tv[o], vb = m.tv[o + 1], vc = m.tv[o + 2];
+        if (va >= n || vb >= n || vc >= n)
+            continue;
+        const cxp = (points[va][0] + points[vb][0] + points[vc][0]) / 3;
+        const cyp = (points[va][1] + points[vb][1] + points[vc][1]) / 3;
+        if (!pnpoly(cxp, cyp, outerPoly))
+            continue;
+        if (holePolys.some((h) => pnpoly(cxp, cyp, h)))
+            continue;
+        geom.push([va, vb, vc]);
+    }
+    return geom;
+}
+//# sourceMappingURL=cdt2d.js.map

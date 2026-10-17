@@ -7,7 +7,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BumpMesh by CNC Kitchen</title>
+  <title>BumpMesh Local by Kurt</title>
   <meta name="description" content="BumpMesh by CNC Kitchen is a browser-based tool for adding displacement textures to STL, OBJ, and 3MF models locally, then exporting printable textured meshes." />
   <link rel="canonical" href="https://bumpmesh.com/" />
   <meta property="og:locale" content="en_US" />
@@ -39,23 +39,22 @@
       if (!prefersDark) document.documentElement.setAttribute('data-theme', 'light');
     })();
   </script>
-  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
   <script type="importmap">
   {
     "imports": {
-      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
-      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
-      "fflate": "https://cdn.jsdelivr.net/npm/fflate@0.8.2/esm/browser.js"
+      "three": "./vendor/three/build/three.module.js",
+      "three/addons/": "./vendor/three/examples/jsm/",
+      "fflate": "./vendor/fflate/esm/browser.js"
     }
   }
   </script>
-  <link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js">
+  <link rel="modulepreload" href="./vendor/three/build/three.module.js">
 </head>
 <body>
   <header>
     <div class="logo">
       <img src="logo.png" alt="BumpMesh" width="24" height="24" />
-      <span>BumpMesh <span id="app-version" class="app-version"></span> <small style="opacity:.6;font-weight:400">by <a href="https://www.youtube.com/@CNCKitchen" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline">CNC Kitchen</a></small></span>
+      <span>BumpMesh Local <span id="app-version" class="app-version"></span> <small style="opacity:.6;font-weight:400">by Kurt</small></span>
     </div>
     <div class="header-actions">
       <div class="project-io">
@@ -106,7 +105,7 @@
   </header>
 
   <main>
-    <!-- â”€â”€â”€ 3-D Viewport â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+    <!-- ─── 3-D Viewport ─────────────────────────────────────────── -->
     <section id="viewport-section">
       <div id="drop-zone" class="drop-zone">
         <div id="drop-hint" class="drop-hint">
@@ -151,11 +150,6 @@
           <span data-i18n="warnings.softwareRendering">⚠ 3D is being rendered on the CPU — hardware acceleration is off or unavailable in this browser, so the viewer will be slow. Turn on “Use graphics acceleration when available” in the browser settings and restart it; chrome://gpu should then list WebGL as “Hardware accelerated”. On laptops with several GPUs, set the browser to “High performance” in the OS graphics settings.</span>
           <button id="gpu-warning-dismiss" class="gpu-warning-dismiss" aria-label="Dismiss">&times;</button>
         </div>
-        <div id="store-cta-wrapper">
-          <span id="store-cta">
-            <span data-i18n-html="cta.store">Support this tool? Shop at <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener noreferrer">CNCKitchen.STORE</a> or send a tip via <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener noreferrer">PayPal</a> / <a href="https://ko-fi.com/cnckitchen" target="_blank" rel="noopener noreferrer">Ko-fi</a></span><button id="store-cta-dismiss" aria-label="Dismiss">&times;</button>
-          </span>
-        </div>
       </div>
       <div id="viewport-footer">
         <span id="mesh-info" class="mesh-info"></span>
@@ -180,11 +174,11 @@
           <button type="button" class="section-btn" id="section-flip" data-i18n="ui.sectionFlip" data-i18n-title="ui.sectionFlipTitle" title="Show the other half">Flip</button>
         </div>
 
-        <div class="viewport-controls-hint" data-i18n="ui.controlsHint">Left drag: orbit &nbsp;Â·&nbsp; Right drag: pan &nbsp;Â·&nbsp; Scroll: zoom</div>
+        <div class="viewport-controls-hint" data-i18n="ui.controlsHint">Left drag: orbit &nbsp;·&nbsp; Right drag: pan &nbsp;·&nbsp; Scroll: zoom</div>
       </div>
     </section>
 
-    <!-- â”€â”€â”€ Settings Panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+    <!-- ─── Settings Panel ───────────────────────────────────────── -->
     <!-- Collapse tab on the sidebar's edge (js/sidebarToggle.js); hides the settings panel or gallery so the viewport gets the room -->
     <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-expanded="true" aria-controls="settings-panel gallery-panel"
       data-i18n-aria-label="ui.toggleSidebar" aria-label="Show or hide the sidebar"
@@ -199,7 +193,7 @@
         <div class="load-stl-row">
           <label class="upload-btn" for="stl-file-input" style="flex:1;justify-content:center;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 2L2 7l10 5 10-5-10-5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
-            <span data-i18n="ui.loadStl">Load Modelâ€¦</span>
+            <span data-i18n="ui.loadStl">Load Model…</span>
           </label>
           <button id="place-on-face-btn" class="place-on-face-btn" data-i18n-title="ui.placeOnFaceTitle" title="Click a face to orient it downward onto the print bed">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 3v14m0 0l-5-5m5 5l5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 21h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
@@ -220,22 +214,22 @@
         <div id="rotate-controls" class="rotate-controls hidden">
           <div class="rotate-inputs-row">
             <div class="rotate-input-group">
-              <label for="rotate-x">XÂ°</label>
+              <label for="rotate-x">X°</label>
               <input type="number" id="rotate-x" class="val" value="0" step="1" />
             </div>
             <div class="rotate-input-group">
-              <label for="rotate-y">YÂ°</label>
+              <label for="rotate-y">Y°</label>
               <input type="number" id="rotate-y" class="val" value="0" step="1" />
             </div>
             <div class="rotate-input-group">
-              <label for="rotate-z">ZÂ°</label>
+              <label for="rotate-z">Z°</label>
               <input type="number" id="rotate-z" class="val" value="0" step="1" />
             </div>
             <button id="rotate-apply-btn" class="rotate-apply-btn" data-i18n="ui.rotateApply">Apply</button>
             <button id="rotate-reset-btn" class="rotate-reset-btn" data-i18n="ui.rotateReset">Reset</button>
           </div>
         </div>
-        <p style="margin:.4em 0 0;font-size:.75rem;opacity:.55;text-align:center;" data-i18n="ui.localProcessingNote">All processing runs locally in your browser â€” no data is uploaded.</p>
+        <p style="margin:.4em 0 0;font-size:.75rem;opacity:.55;text-align:center;" data-i18n="ui.localProcessingNote">All processing runs locally in your browser — no data is uploaded.</p>
       </section>
 
       <!-- Displacement Map -->
@@ -286,7 +280,7 @@
           </label>
         </div>
         <div class="form-row slider-row">
-          <label for="texture-smoothing" data-i18n="labels.textureSmoothing" data-i18n-title="tooltips.textureSmoothing" title="Applies a Gaussian blur to the displacement map. Higher values produce softer, more gradual surface detail. 0 = off.">Texture Smoothing â“˜</label>
+          <label for="texture-smoothing" data-i18n="labels.textureSmoothing" data-i18n-title="tooltips.textureSmoothing" title="Applies a Gaussian blur to the displacement map. Higher values produce softer, more gradual surface detail. 0 = off.">Texture Smoothing ⓘ</label>
           <input type="range" id="texture-smoothing" min="0" max="20" step="any" value="0" />
           <input type="number" class="val" id="texture-smoothing-val" value="0" min="0" max="20" step="any" data-wheel-decimals="1" />
         </div>
@@ -308,17 +302,17 @@
           </select>
         </div>
         <div class="form-row slider-row" style="display:none">
-          <label for="seam-blend" data-i18n="labels.seamBlend" data-i18n-title="tooltips.seamBlend" title="Softens the hard seam where projection faces meet. Effective for Cubic and Cylindrical modes.">Seam Blend â“˜</label>
+          <label for="seam-blend" data-i18n="labels.seamBlend" data-i18n-title="tooltips.seamBlend" title="Softens the hard seam where projection faces meet. Effective for Cubic and Cylindrical modes.">Seam Blend ⓘ</label>
           <input type="range" id="seam-blend" min="0" max="1" step="0.01" value="1" />
           <input type="number" class="val" id="seam-blend-val" value="1" min="0" max="1" step="0.01" />
         </div>
         <div class="form-row slider-row">
-          <label for="seam-band-width" data-i18n="labels.transitionSmoothing" data-i18n-title="tooltips.transitionSmoothing" title="Width of the blending zone near seam edges. Lower values keep transitions tight to the seam; higher values blend a wider band.">Transition Smoothing â“˜</label>
+          <label for="seam-band-width" data-i18n="labels.transitionSmoothing" data-i18n-title="tooltips.transitionSmoothing" title="Width of the blending zone near seam edges. Lower values keep transitions tight to the seam; higher values blend a wider band.">Transition Smoothing ⓘ</label>
           <input type="range" id="seam-band-width" min="0" max="1" step="0.01" value="0.5" />
           <input type="number" class="val" id="seam-band-width-val" value="0.5" min="0" max="1" step="0.01" data-wheel-decimals="2" />
         </div>
         <div class="form-row slider-row" id="cap-angle-row" style="display:none">
-          <label for="cap-angle" data-i18n="labels.capAngle" data-i18n-title="tooltips.capAngle" title="Angle (in degrees) from vertical at which the top/bottom cap projection kicks in. Smaller values limit cap projection to nearly flat faces.">Cap Angle â“˜</label>
+          <label for="cap-angle" data-i18n="labels.capAngle" data-i18n-title="tooltips.capAngle" title="Angle (in degrees) from vertical at which the top/bottom cap projection kicks in. Smaller values limit cap projection to nearly flat faces.">Cap Angle ⓘ</label>
           <input type="range" id="cap-angle" min="1" max="89" step="1" value="20" />
           <input type="number" class="val" id="cap-angle-val" value="20" min="1" max="89" step="1" />
         </div>
@@ -327,7 +321,7 @@
             data-i18n-title="tooltips.snapSeamless"
             title="Snap U scale to integer wrap counts so the texture seamlessly wraps around the cylinder or sphere.">
             <input type="checkbox" id="cylinder-snap-toggle" checked />
-            <span data-i18n="labels.snapSeamless">Snap to seamless wrap â“˜</span>
+            <span data-i18n="labels.snapSeamless">Snap to seamless wrap ⓘ</span>
           </label>
         </div>
         <div class="form-row" id="cylinder-axis-row" style="display:none">
@@ -360,7 +354,7 @@
           </label>
         </div>
         <div id="amplitude-warning" class="amplitude-warning hidden" data-i18n="warnings.textureHeightOverlap">
-          âš  Texture height exceeds 10% of the smallest model dimension â€” geometry overlaps may occur in the exported STL.
+          ⚠ Texture height exceeds 10% of the smallest model dimension — geometry overlaps may occur in the exported STL.
         </div>
 
         <div class="form-row">
@@ -368,7 +362,7 @@
             data-i18n-title="tooltips.symmetricDisplacement"
             title="When on, 50% grey = no displacement; white pushes out, black pushes in. Keeps part volume roughly constant.">
             <input type="checkbox" id="symmetric-displacement" />
-            <span data-i18n="labels.symmetricDisplacement">Symmetric displacement â“˜</span>
+            <span data-i18n="labels.symmetricDisplacement">Symmetric displacement ⓘ</span>
           </label>
         </div>
         <div class="form-row">
@@ -376,10 +370,81 @@
             data-i18n-title="tooltips.displacementPreview"
             title="Subdivides the mesh and displaces vertices in real-time so you can judge the actual depth. GPU-intensive on complex models.">
             <input type="checkbox" id="displacement-preview" />
-            <span data-i18n="labels.displacementPreview">3D Preview â“˜</span>
+            <span data-i18n="labels.displacementPreview">3D Preview ⓘ</span>
           </label>
           <span id="displacement-preview-spinner" class="mesh-diag-spinner hidden"
             data-i18n-title="progress.subdividingPreview" title="Preparing preview…"></span>
+        </div>
+      </section>
+
+      <!-- Per-layer spatial texture gradient -->
+      <section class="panel-section" id="texture-gradient-section">
+        <h2 data-i18n="gradient.heading">Texture gradient</h2>
+        <div class="form-row">
+          <label class="checkbox-label" for="gradient-enabled">
+            <input type="checkbox" id="gradient-enabled" />
+            <span data-i18n="gradient.enabled">Enable for this layer</span>
+          </label>
+        </div>
+        <p class="hint gradient-intro" data-i18n="gradient.intro">Vary depth, pattern size, or blend across the model.</p>
+        <div class="gradient-presets" aria-label="Gradient presets" data-i18n-aria-label="gradient.presets">
+          <button type="button" data-gradient-preset="fadeIn" data-i18n="gradient.fadeIn">Fade in</button>
+          <button type="button" data-gradient-preset="fadeOut" data-i18n="gradient.fadeOut">Fade out</button>
+          <button type="button" data-gradient-preset="center" data-i18n="gradient.centerGrip">Center grip</button>
+          <button type="button" data-gradient-preset="grow" data-i18n="gradient.grow">Grow pattern</button>
+          <button type="button" data-gradient-preset="crossfade" data-i18n="gradient.crossfade">Crossfade</button>
+        </div>
+        <div id="gradient-controls" hidden>
+          <div class="form-row">
+            <label for="gradient-axis" data-i18n="gradient.axis">Axis</label>
+            <select id="gradient-axis">
+              <option value="z" data-i18n-opt="gradient.axisZ">Z — bottom to top</option>
+              <option value="x" data-i18n-opt="gradient.axisX">X direction</option>
+              <option value="y" data-i18n-opt="gradient.axisY">Y direction</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label for="gradient-mode" data-i18n="gradient.shape">Shape</label>
+            <select id="gradient-mode">
+              <option value="ramp" data-i18n-opt="gradient.ramp">End-to-end</option>
+              <option value="band" data-i18n-opt="gradient.band">Center band</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label for="gradient-curve" data-i18n="gradient.transition">Transition</label>
+            <select id="gradient-curve">
+              <option value="smooth" data-i18n-opt="gradient.smooth">Smooth</option>
+              <option value="linear" data-i18n-opt="gradient.linear">Linear</option>
+            </select>
+          </div>
+          <div class="gradient-region">
+            <span data-i18n="gradient.region">Region of model (%)</span>
+            <label for="gradient-start"><span data-i18n="gradient.from">From</span><input id="gradient-start" type="number" min="0" max="99.9" step="1" value="0" /></label>
+            <label for="gradient-end"><span data-i18n="gradient.to">To</span><input id="gradient-end" type="number" min="0.1" max="100" step="1" value="100" /></label>
+          </div>
+          <div class="gradient-endpoints">
+            <span></span><span id="gradient-column-start">Start</span><span id="gradient-column-end">End</span>
+            <span data-i18n="gradient.depth">Depth</span>
+            <input id="gradient-depth-start" type="number" min="0" max="200" step="5" value="0" aria-label="Depth — start (%)" />
+            <input id="gradient-depth-end" type="number" min="0" max="200" step="5" value="100" aria-label="Depth — end (%)" />
+            <span data-i18n="gradient.scale">Pattern size</span>
+            <input id="gradient-scale-start" type="number" min="25" max="400" step="5" value="100" aria-label="Pattern size — start (%)" />
+            <input id="gradient-scale-end" type="number" min="25" max="400" step="5" value="100" aria-label="Pattern size — end (%)" />
+            <span data-i18n="gradient.opacity">Blend</span>
+            <input id="gradient-opacity-start" type="number" min="0" max="100" step="5" value="100" aria-label="Blend — start (%)" />
+            <input id="gradient-opacity-end" type="number" min="0" max="100" step="5" value="100" aria-label="Blend — end (%)" />
+          </div>
+          <p class="hint" data-i18n="gradient.percentHint">100% uses the layer's depth and tile size. Blend 0% reveals lower layers.</p>
+          <div class="gradient-profile-legend" aria-hidden="true"><span class="gradient-depth-label" data-i18n="gradient.depth">Depth</span><span class="gradient-scale-label" data-i18n="gradient.scale">Pattern size</span><span class="gradient-opacity-label" data-i18n="gradient.opacity">Blend</span></div>
+          <svg id="gradient-profile" class="gradient-profile" viewBox="0 0 300 72" role="img" aria-label="Gradient profile across the model">
+            <path class="gradient-profile-baseline" d="M8,62 H292" />
+            <path data-gradient-line="scale" class="gradient-scale-line" d="" />
+            <path data-gradient-line="opacity" class="gradient-opacity-line" d="" />
+            <path data-gradient-line="depth" class="gradient-depth-line" d="" />
+          </svg>
+          <p id="gradient-summary" class="hint gradient-summary" aria-live="polite"></p>
+          <p id="gradient-size-hint" class="hint" data-i18n="gradient.sizeHint" hidden>Size gradients stretch the projected pattern. Wrapped patterns can develop seams.</p>
+          <button id="gradient-reverse" class="gradient-reverse" type="button" data-i18n="gradient.reverse">Swap start and end values</button>
         </div>
       </section>
 
@@ -389,7 +454,7 @@
         <p class="advanced-blurb" data-i18n="labels.scaleManualHint">Type a value in the box for smaller or larger sizes</p>
 
         <div class="form-row slider-row">
-          <label for="scale-u" data-i18n="labels.textureSizeU" data-i18n-title="tooltips.textureSize" title="Physical size of one texture repeat in millimetres â€” the same value gives the same physical pattern size on any model.">Size U (mm)</label>
+          <label for="scale-u" data-i18n="labels.textureSizeU" data-i18n-title="tooltips.textureSize" title="Physical size of one texture repeat in millimetres — the same value gives the same physical pattern size on any model.">Size U (mm)</label>
           <input type="range" id="scale-u" min="0" max="1000" step="1" value="435" />
           <input type="number" class="val" id="scale-u-val" value="25" min="0.01" max="10000" step="0.5" />
         </div>
@@ -405,7 +470,7 @@
         </div>
 
         <div class="form-row slider-row">
-          <label for="scale-v" data-i18n="labels.textureSizeV" data-i18n-title="tooltips.textureSize" title="Physical size of one texture repeat in millimetres â€” the same value gives the same physical pattern size on any model.">Size V (mm)</label>
+          <label for="scale-v" data-i18n="labels.textureSizeV" data-i18n-title="tooltips.textureSize" title="Physical size of one texture repeat in millimetres — the same value gives the same physical pattern size on any model.">Size V (mm)</label>
           <input type="range" id="scale-v" min="0" max="1000" step="1" value="435" />
           <input type="number" class="val" id="scale-v-val" value="25" min="0.01" max="10000" step="0.5" />
         </div>
@@ -431,7 +496,7 @@
         <h2 data-i18n="sections.masking">Masking</h2>
 
         <!-- By Angle -->
-        <h3 class="panel-subsection-heading" data-i18n="sections.maskAngles" data-i18n-title="tooltips.maskAngles" title="0Â° = no masking. Surfaces within this angle of horizontal will not be textured.">By Angle â“˜</h3>
+        <h3 class="panel-subsection-heading" data-i18n="sections.maskAngles" data-i18n-title="tooltips.maskAngles" title="0° = no masking. Surfaces within this angle of horizontal will not be textured.">By Angle ⓘ</h3>
         <div class="form-row slider-row">
           <label for="bottom-angle-limit" data-i18n="labels.bottomFaces" data-i18n-title="tooltips.bottomFaces" title="Suppress texture on downward-facing surfaces within this angle of horizontal">Bottom faces</label>
           <input type="range" id="bottom-angle-limit" min="0" max="90" step="1" value="5" />
@@ -444,7 +509,7 @@
         </div>
 
         <!-- By Surface -->
-        <h3 class="panel-subsection-heading" id="excl-section-heading" data-i18n="sections.surfaceMasking" data-i18n-title="tooltips.surfaceMasking" title="Mask surfaces to control which areas receive displacement.">By Surface â“˜</h3>
+        <h3 class="panel-subsection-heading" id="excl-section-heading" data-i18n="sections.surfaceMasking" data-i18n-title="tooltips.surfaceMasking" title="Mask surfaces to control which areas receive displacement.">By Surface ⓘ</h3>
         <p id="excl-hint" class="excl-hint" style="display:none"></p>
 
         <!-- Mode toggle: Exclude / Include Only -->
@@ -543,19 +608,19 @@
         <h2 class="advanced-toggle" id="advanced-toggle"
             data-i18n="sections.advancedFeatures"
             data-i18n-title="tooltips.advancedFeatures"
-            title="Experimental tools â€” behavior may change between releases.">
-          <span class="advanced-chevron" aria-hidden="true">â–¸</span>
-          Advanced / Beta Features â“˜
+            title="Experimental tools — behavior may change between releases.">
+          <span class="advanced-chevron" aria-hidden="true">▸</span>
+          Advanced / Beta Features ⓘ
         </h2>
         <div class="advanced-content" id="advanced-content">
           <p class="advanced-blurb" data-i18n="ui.advancedBlurb">Experimental tools. Behavior may change between releases.</p>
 
           <h3 class="panel-subsection-heading" data-i18n="ui.noDownwardZHeading">Overhang Protection</h3>
-          <p class="advanced-blurb" data-i18n="ui.noDownwardZDesc">Some textures push surface vertices downward, creating new overhangs. When enabled, vertices are never moved in the âˆ’Z direction during texturing. X and Y movement is unaffected.</p>
+          <p class="advanced-blurb" data-i18n="ui.noDownwardZDesc">Some textures push surface vertices downward, creating new overhangs. When enabled, vertices are never moved in the −Z direction during texturing. X and Y movement is unaffected.</p>
           <div class="form-row">
             <label class="checkbox-label" for="no-downward-z-chk">
               <input type="checkbox" id="no-downward-z-chk" />
-              <span data-i18n="ui.noDownwardZ">Prevent downward (âˆ’Z) vertex displacement</span>
+              <span data-i18n="ui.noDownwardZ">Prevent downward (−Z) vertex displacement</span>
             </label>
           </div>
 
@@ -569,7 +634,7 @@
           </div>
 
           <h3 class="panel-subsection-heading" data-i18n="ui.harvestFlatHeading">Harvest Flat Faces</h3>
-          <p class="advanced-blurb" data-i18n="ui.harvestFlatDesc">When decimation reaches the triangle limit there are often still flat faces left that cost almost nothing to remove. With this on, decimation keeps collapsing them past the limit â€” as long as each collapse moves the surface less than the tolerance below â€” saving extra triangles without losing visible detail.</p>
+          <p class="advanced-blurb" data-i18n="ui.harvestFlatDesc">When decimation reaches the triangle limit there are often still flat faces left that cost almost nothing to remove. With this on, decimation keeps collapsing them past the limit — as long as each collapse moves the surface less than the tolerance below — saving extra triangles without losing visible detail.</p>
           <div class="form-row">
             <label class="checkbox-label" for="harvest-flat-chk">
               <input type="checkbox" id="harvest-flat-chk" checked />
@@ -603,7 +668,7 @@
               <div id="bake-progress-bar" class="export-progress-bar"></div>
               <span id="bake-progress-pct" class="export-progress-pct"></span>
             </div>
-            <span id="bake-progress-label" data-i18n="progress.processing">Processingâ€¦</span>
+            <span id="bake-progress-label" data-i18n="progress.processing">Processing…</span>
           </div>
           <div class="export-buttons">
             <button id="bake-btn" class="export-btn" disabled
@@ -619,7 +684,7 @@
 
       <!-- Export -->
       <section class="panel-section">
-        <h2 data-i18n="sections.export" data-i18n-title="tooltips.export" title="Smaller edge length = finer displacement detail. Output is then decimated to the triangle limit.">Export â“˜</h2>
+        <h2 data-i18n="sections.export" data-i18n-title="tooltips.export" title="Smaller edge length = finer displacement detail. Output is then decimated to the triangle limit.">Export ⓘ</h2>
         <button id="smart-res-btn" class="smart-res-btn" disabled
                 data-i18n="labels.smartRes"
                 data-i18n-title="tooltips.smartRes"
@@ -637,7 +702,7 @@
           <input type="number" class="val" id="refine-length-val" value="1" min="0.01" max="100" step="0.01" data-wheel-decimals="2" />
         </div>
         <div id="resolution-warning" class="resolution-warning hidden" data-i18n="warnings.resolutionTooCoarse">
-          âš  Resolution is coarser than 1/100 of the model's bounding box diagonal â€” fine details will be lost. Lower the value for finer results.
+          ⚠ Resolution is coarser than 1/100 of the model's bounding box diagonal — fine details will be lost. Lower the value for finer results.
         </div>
         <div class="form-row slider-row">
           <label for="max-triangles" data-i18n="labels.outputTriangles" data-i18n-title="tooltips.outputTriangles" title="Mesh is fully subdivided first, then decimated down to this count">Output Triangles</label>
@@ -645,7 +710,7 @@
           <span class="val" id="max-triangles-val">0.75 M</span>
         </div>
         <div id="tri-limit-warning" class="tri-limit-warning hidden" data-i18n="warnings.safetyCapHit">
-          âš  16M-triangle safety cap hit during subdivision â€” result may still be coarser than requested edge length.
+          ⚠ 16M-triangle safety cap hit during subdivision — result may still be coarser than requested edge length.
         </div>
 
         <div id="export-progress" class="export-progress hidden">
@@ -653,11 +718,11 @@
             <div id="export-progress-bar" class="export-progress-bar"></div>
             <span id="export-progress-pct" class="export-progress-pct"></span>
           </div>
-          <span id="export-progress-label" data-i18n="progress.processing">Processingâ€¦</span>
+          <span id="export-progress-label" data-i18n="progress.processing">Processing…</span>
         </div>
         <div class="export-buttons">
           <button id="export-btn" class="export-btn" disabled data-i18n="ui.exportStl" data-i18n-title="tooltips.exportStl" title="Widely compatible with all slicers">Export STL</button>
-          <button id="export-3mf-btn" class="export-btn" disabled data-i18n="ui.export3mf" data-i18n-title="tooltips.export3mf" title="Smaller file size â€” may not be accepted by all slicers">Export 3MF</button>
+          <button id="export-3mf-btn" class="export-btn" disabled data-i18n="ui.export3mf" data-i18n-title="tooltips.export3mf" title="Smaller file size — may not be accepted by all slicers">Export 3MF</button>
         </div>
       </section>
 
@@ -766,29 +831,6 @@
         <li data-i18n-html="imprint.privacyExternal">This site contains links to external websites (e.g., CNCKitchen.STORE, PayPal, Ko-fi). These sites have their own privacy policies, over which we have no control.</li>
         <li data-i18n-html="imprint.privacyRights">Under the GDPR you have the right to <strong>access, rectification, erasure, restriction of processing, data portability</strong>, and the right to <strong>lodge a complaint</strong> with a supervisory authority.</li>
       </ul>
-    </div>
-  </div>
-
-  <!-- Sponsor popup -->
-  <div id="sponsor-overlay" class="sponsor-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="sponsor-title">
-    <div class="sponsor-modal">
-      <h2 id="sponsor-title" data-i18n="sponsor.title">Thanks for using BumpMesh by CNC Kitchen!</h2>
-      <p data-i18n-html="sponsor.body">This tool is provided <strong>completely free</strong> by CNC Kitchen.<br>
-      While your STL is being processed, why not check out the <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener noreferrer" class="modal-text-link">store</a> that helps us keep making cool stuff for you?</p>
-      <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener noreferrer" class="sponsor-link" data-i18n="sponsor.visitStore">
-        ðŸ›’ Visit CNCKitchen.STORE
-      </a>
-      <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener noreferrer" class="sponsor-link sponsor-link--paypal" data-i18n="sponsor.donate">
-        ðŸ’™ Send a tip on PayPal
-      </a>
-      <a href="https://ko-fi.com/cnckitchen" target="_blank" rel="noopener noreferrer" class="sponsor-link sponsor-link--kofi" data-i18n="sponsor.donateKofi">
-        â˜• Send a tip on Ko-fi
-      </a>
-      <label class="sponsor-no-show">
-        <input type="checkbox" id="sponsor-dont-show" />
-        <span data-i18n="sponsor.dontShow">Don't show this again</span>
-      </label>
-      <button id="sponsor-close" class="sponsor-close-btn" data-i18n-html="sponsor.closeAndContinue">Close &amp; Continue</button>
     </div>
   </div>
 

@@ -8,7 +8,7 @@
 // Tessellating a STEP B-rep is CPU-heavy (seconds for real parts), so it runs
 // here instead of the main thread. meshStep is pure JS with zero dependencies,
 // so unlike exportWorker there is no three.js/import-map dance — one pinned
-// CDN module is the whole payload.
+// local distribution is the whole payload.
 //
 // Protocol (mirrors exportWorker.js):
 //   worker → main:  { type:'ready' }                       — module loaded
@@ -27,7 +27,7 @@ import {
   importStep,
   estimateStepSize,
   autoTessellation,
-} from 'https://cdn.jsdelivr.net/npm/meshstep@0.1.0/+esm';
+} from '../vendor/meshstep/dist/index.js';
 import { resolveStepSettings, stepResultToSoup, summarizeDiagnostics } from './stepConvert.js';
 
 self.onmessage = (e) => {

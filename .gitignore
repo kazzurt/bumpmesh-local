@@ -1,8 +1,8 @@
 assets/
 .claude/
 node_modules/
-package.json
-package-lock.json
+.npm-cache/
+bumpmesh-local-working/
 debug_out/
 *.stl
 *.3mf

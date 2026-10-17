@@ -1,0 +1,19 @@
+{
+  "name": "bumpmesh-local",
+  "version": "1.4.0-local.2",
+  "private": true,
+  "type": "module",
+  "description": "Local, offline-capable BumpMesh with Kurtz's texture library",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "start": "node scripts/local-server.mjs",
+    "vendor": "node scripts/vendor-dependencies.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:paint": "node test-paint-tree.mjs"
+  },
+  "dependencies": {
+    "fflate": "0.8.2",
+    "meshstep": "0.1.0",
+    "three": "0.170.0"
+  }
+}

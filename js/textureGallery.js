@@ -21,6 +21,7 @@ const CREDITS = {
   hero: { badge: 'HP',  title: 'Hero Patterns (CC BY 4.0)' },
   cc0:  { badge: 'CC0', title: 'CC0' },
   ff:   { badge: 'FF',  title: 'Filter Forge' },
+  local: { badge: 'Local', title: 'From your local texture folder' },
 };
 const KEY_APPLY_DELAY_MS = 150;   // arrow-key browsing applies once the key rests, not per repeat
 // Presets are keyed by name, the user's own textures by this prefix + library id. The key is also
@@ -37,6 +38,10 @@ const isCustomKey = (key) => key.startsWith(CUSTOM_PREFIX);
 /** Everything the gallery shows is an item: { key, name, thumb, category, credit?, idx | custom }. */
 const PRESET_ITEMS = IMAGE_PRESETS.map((p, idx) => ({
   key: p.name, name: p.name, thumb: p.thumb, category: p.category, credit: p.credit, idx,
+  keywords: [p.filename || '', ...(p.keywords || [])].join(' ').toLowerCase(),
+  title: p.category === 'local'
+    ? `${p.name} · ${p.width}×${p.height} · ${p.tiling?.status === 'pass' ? 'Edge check passed (inspect the repeated pattern)' : 'Inspect the repeated pattern for seams'}`
+    : undefined,
 }));
 
 function formatBytes(n) {
@@ -75,6 +80,7 @@ function makeSwatch(item, onPick) {
   el.className = 'preset-swatch preset-loading';
   el.dataset.key = item.key;
   el.setAttribute('role', 'button');
+  el.setAttribute('aria-label', item.name);
   el.tabIndex = 0;
   el.title = item.title || item.name;
 
@@ -202,7 +208,7 @@ export function initTextureGallery({ onSelect, onSelectCustom, setTurntable }) {
       badge.className = 'gallery-badge';
       badge.textContent = CREDITS[item.credit].badge;
       sw.appendChild(badge);
-      sw.title = `${item.name} · ${CREDITS[item.credit].title}`;
+      sw.title = `${item.title || item.name} · ${CREDITS[item.credit].title}`;
     }
 
     const star = document.createElement('button');
@@ -332,7 +338,8 @@ export function initTextureGallery({ onSelect, onSelectCustom, setTurntable }) {
       .map(c => [c.id, t(c.label).toLowerCase()]));
     const matches = (key) => {
       const item = items.get(key);
-      return !q || item.name.toLowerCase().includes(q) || catLabel[item.category].includes(q);
+      return !q || item.name.toLowerCase().includes(q) || (catLabel[item.category] || '').includes(q)
+        || (item.keywords || '').includes(q);
     };
     body.innerHTML = '';
     const frag = document.createDocumentFragment();

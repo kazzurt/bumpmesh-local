@@ -17,6 +17,8 @@ import { estimateStep } from './stepLoader.js';
 import { resolveStepSettings } from './stepConvert.js';
 import { computeSmartResolution } from './smartResolution.js';
 import { REF_TEXTURE_SIZE } from './textureAnalysis.js';
+import { GRADIENT_DEFAULTS, GRADIENT_KEYS, normalizeGradientSettings } from './textureGradient.js';
+import { initGradientControls } from './gradientControls.js';
 import { loadFullPreset, loadCustomTexture, IMAGE_PRESETS }  from './presetTextures.js';
 import { initTextureGallery } from './textureGallery.js';
 import { getCustomTextureFile } from './customTextures.js';
@@ -100,6 +102,7 @@ let _strokeLastPoint   = null;        // THREE.Vector3 — previous point of the
 let _shiftLineMesh     = null;        // THREE.Line — preview line from last paint to cursor
 
 const settings = {
+  ...GRADIENT_DEFAULTS,
   mappingMode:   5,     // Triplanar default
   // Texture tile size in ABSOLUTE millimetres (one full repeat along U/V).
   // Initialized per model on load: DEFAULT_TILE_FRACTION × largest bbox edge
@@ -179,6 +182,7 @@ const settings = {
 // Everything else in `settings` (resolution, triangle limit, angle masks,
 // bottom handling, regularize knobs) stays global.
 const LAYER_KEYS = [
+  ...GRADIENT_KEYS,
   'mappingMode', 'scaleU', 'scaleV', 'lockScale',
   'offsetU', 'offsetV', 'rotation',
   'amplitude', 'textureHeight', 'invertDisplacement', 'invertTexture', 'textureSmoothing',
@@ -270,6 +274,7 @@ let dispPreviewEdgeInfo  = null;   // { floorEdge, maxEdge, edge } of the latest
 // init already call cancelDisplacementPreviewBuild().
 let _previewWorkerAbort  = null;   // set while a worker build is in flight: kill + resolve(null)
 let _dispPreviewResolutionTimer = null;
+let _dispPreviewResumeQueued = false;
 
 // 3D-preview mesh budget, in predicted first-subdivide triangles (see
 // choosePreviewEdge in previewPipeline.js).  That count drives the build time
@@ -293,6 +298,7 @@ let activeDiagHighlight = null; // which highlight is showing: 'openEdges'|'nonM
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
+let gradientControls = null;
 const canvas         = document.getElementById('viewport');
 const brushCursorEl  = document.getElementById('brush-cursor');
 const dropZone       = document.getElementById('drop-zone');
@@ -410,6 +416,10 @@ const falloffCurveButtons      = {
 const symmetricDispToggle    = document.getElementById('symmetric-displacement');
 const dispPreviewToggle      = document.getElementById('displacement-preview');
 const dispPreviewSpinner     = document.getElementById('displacement-preview-spinner');
+// The 3D Preview checkbox is the user's standing choice: it survives model
+// loads, masking tools and page reloads (see _resumeDisplacementPreview).
+const DISP_PREVIEW_STORAGE_KEY = 'bumpmesh-3d-preview';
+try { dispPreviewToggle.checked = localStorage.getItem(DISP_PREVIEW_STORAGE_KEY) === '1'; } catch { /* private mode */ }
 const noDownwardZChk         = document.getElementById('no-downward-z-chk');
 const smoothBottomChk        = document.getElementById('smooth-bottom-chk');
 const smoothBottomRow        = document.getElementById('smooth-bottom-row');
@@ -1093,6 +1103,7 @@ function populateLanguageSelector() {
     _scheduleCylinderPanelRedraw();
     gallery.refreshText();
     _renderLayerStrip();
+    gradientControls?.sync();
   });
 
   languageSelector.appendChild(select);
@@ -1435,6 +1446,12 @@ function syncSmoothBottomToLimit() {
 // ── Event wiring ──────────────────────────────────────────────────────────────
 
 function wireEvents() {
+  gradientControls = initGradientControls({ settings, translate: t, onChange: () => {
+    checkAmplitudeWarning();
+    updatePreview();
+    _autoSaveSettings();
+    _scheduleUndoCapture();
+  } });
   // ── Model loading ──
   stlFileInput.addEventListener('change', (e) => {
     const file = e.target.files[0];
@@ -1713,6 +1730,7 @@ function wireEvents() {
   });
 
   dispPreviewToggle.addEventListener('change', () => {
+    try { localStorage.setItem(DISP_PREVIEW_STORAGE_KEY, dispPreviewToggle.checked ? '1' : '0'); } catch { /* private mode */ }
     toggleDisplacementPreview(dispPreviewToggle.checked);
   });
 
@@ -1783,38 +1801,9 @@ function wireEvents() {
     clearDiagHighlight();
   });
 
-  // ── Support banner dismiss ──
-  document.getElementById('store-cta-dismiss').addEventListener('click', () => {
-    document.getElementById('store-cta-wrapper').classList.add('store-cta-hidden');
-  });
-
   // ── Export ──
-  const startExport = (format) => {
-    // Start the export immediately — the pipeline runs in the worker, so the
-    // sponsor overlay sits on top of a live progress bar instead of delaying
-    // the work until it's dismissed.
-    handleExport(format);
-
-    if (sessionStorage.getItem('stlt-no-sponsor') === '1') return;
-    const overlay = document.getElementById('sponsor-overlay');
-    const closeBtn = document.getElementById('sponsor-close');
-    // Button plus the inline text link (the button may be hidden or removed by adblockers)
-    const storeLinks = overlay.querySelectorAll('a[href="https://geni.us/CNCStoreTexture"]');
-    overlay.classList.remove('hidden');
-    trapFocus(overlay);
-
-    const dismiss = () => {
-      if (document.getElementById('sponsor-dont-show').checked) {
-        sessionStorage.setItem('stlt-no-sponsor', '1');
-      }
-      overlay.classList.add('hidden');
-    };
-
-    closeBtn.onclick = dismiss;
-    storeLinks.forEach(a => { a.onclick = () => setTimeout(dismiss, 150); });
-  };
-  exportBtn.addEventListener('click', () => startExport('stl'));
-  export3mfBtn.addEventListener('click', () => startExport('3mf'));
+  exportBtn.addEventListener('click', () => handleExport('stl'));
+  export3mfBtn.addEventListener('click', () => handleExport('3mf'));
 
   // ── Advanced / Beta Features panel: collapse toggle + bake action ──
   advancedToggle.addEventListener('click', () => {
@@ -2135,10 +2124,9 @@ function setExclusionTool(tool) {
     updateMaskModeButtons();
   }
 
-  // Exit 3D displacement preview when a masking tool is activated
+  // Masking paints on the base mesh: show it while a tool is active. The 3D
+  // Preview checkbox stays ticked and the preview returns when the tool closes.
   if (exclusionTool && settings.useDisplacement) {
-    settings.useDisplacement = false;
-    dispPreviewToggle.checked = false;
     toggleDisplacementPreview(false);
   }
   exclBrushBtn.classList.toggle('active', exclusionTool === 'brush');
@@ -2169,6 +2157,7 @@ function setExclusionTool(tool) {
       updateFaceMask(_displayGeometry());
     }
     if (paintTree) paintTree.compactIfNeeded();
+    _resumeDisplacementPreview();
   }
 }
 
@@ -2673,6 +2662,10 @@ function _previewLayers() {
     const tmax = Math.max(tw, th, 1);
     if (isActive) activeIdx = list.length;
     list.push({
+      ...normalizeGradientSettings(s),
+      // Keep the painting slot but let lower relief show through while hidden
+      // or still loading. This override never changes the layer's saved values.
+      ...(!L.visible || !entry ? { gradientEnabled: true, gradientOpacityStart: 0, gradientOpacityEnd: 0 } : {}),
       texture: entry?.texture ?? null,
       mappingMode: s.mappingMode, scaleU: s.scaleU, scaleV: s.scaleV,
       offsetU: s.offsetU, offsetV: s.offsetV, rotation: s.rotation,
@@ -3089,11 +3082,11 @@ function handlePlaceOnFaceClick(e) {
 
   loadGeometry(currentGeometry);
 
-  // Reset displacement preview (an in-flight build used the old pose)
+  // Drop the displacement preview (an in-flight build used the old pose);
+  // updatePreview() below rebuilds it while the 3D Preview box is ticked.
   cancelDisplacementPreviewBuild();
   if (dispPreviewGeometry) { dispPreviewGeometry.dispose(); dispPreviewGeometry = null; }
   settings.useDisplacement = false;
-  dispPreviewToggle.checked = false;
 
   // Deactivate tools but keep the paint (face indices are stable after rotation)
   exclusionTool     = null;
@@ -3541,10 +3534,10 @@ function loadDefaultCube() {
   loadGeometry(geo);
   dropHint.classList.add('hidden');
 
-  // Reset displacement preview
+  // Drop the displacement preview; updatePreview() rebuilds it while the
+  // 3D Preview box is ticked.
   if (dispPreviewGeometry) { dispPreviewGeometry.dispose(); dispPreviewGeometry = null; }
   settings.useDisplacement = false;
-  dispPreviewToggle.checked = false;
 
   // Reset the paint (every layer's strokes indexed the previous mesh)
   _dropPaintGeometry();
@@ -3755,10 +3748,10 @@ async function handleModelFile(file, stepSettings = null) {
     loadGeometry(currentGeometry);
     dropHint.classList.add('hidden');
 
-    // Reset displacement preview for the new mesh
+    // Drop the displacement preview of the old mesh; updatePreview() rebuilds
+    // it for the new one while the 3D Preview box is ticked.
     if (dispPreviewGeometry) { dispPreviewGeometry.dispose(); dispPreviewGeometry = null; }
     settings.useDisplacement = false;
-    dispPreviewToggle.checked = false;
 
     // Reset mesh diagnostics for the new mesh
     meshDiagnostics.classList.add('hidden');
@@ -3848,7 +3841,9 @@ async function handleModelFile(file, stepSettings = null) {
 function checkAmplitudeWarning() {
   if (!currentBounds) return;
   const minDim = Math.min(currentBounds.size.x, currentBounds.size.y, currentBounds.size.z);
-  const danger = settings.textureHeight > minDim * 0.1;
+  const g = normalizeGradientSettings(settings);
+  const depthFactor = g.gradientEnabled ? Math.max(g.gradientDepthStart, g.gradientDepthEnd) : 1;
+  const danger = settings.textureHeight * depthFactor > minDim * 0.1;
   amplitudeWarning.classList.toggle('hidden', !danger);
   amplitudeSlider.classList.toggle('amp-danger', danger);
   amplitudeVal.classList.toggle('amp-danger', danger);
@@ -4047,7 +4042,14 @@ function applySmartResolution() {
   const result = computeSmartResolution({
     geometry: currentGeometry,
     bounds:   currentBounds,
-    settings,
+    // Resolve the smallest projected size and largest relief of this gradient.
+    settings: (() => {
+      const g = normalizeGradientSettings(settings);
+      if (!g.gradientEnabled) return settings;
+      const smallest = Math.min(g.gradientScaleStart, g.gradientScaleEnd);
+      return { ...settings, scaleU: settings.scaleU * smallest, scaleV: settings.scaleV * smallest,
+        amplitude: settings.amplitude * Math.max(g.gradientDepthStart, g.gradientDepthEnd) };
+    })(),
     texture:  effective,
   });
   if (!result) return;
@@ -4158,7 +4160,8 @@ function updateFaceMask(geometry, { forceFalloff = false } = {}) {
       const ls = isActive ? settings : layers[index].settings;
       const dist = ls.boundaryFalloff ?? 0;
       if (dist <= 0) continue;
-      const r = computeBoundaryFalloff(geometry, hards[k], dist, ls.boundaryFalloffCurve);
+      // The 3D preview displaces vertices, so its boundary corners must stay 0.
+      const r = computeBoundaryFalloff(geometry, hards[k], dist, ls.boundaryFalloffCurve, geometry !== dispPreviewGeometry);
       if (!r) continue;
       for (let i = 0; i < posCount; i++) f[i * 4 + k] = r.falloff[i];
       if (isActive) typeAttr.array.set(r.maskType);
@@ -4217,11 +4220,13 @@ function applyFalloffCurve(t, mode = settings.boundaryFalloffCurve) {
  * @param {Uint8Array|null} userMaskedFaces  per-face user-mask flag (1 = masked), null = none
  * @param {number} falloff   falloff distance (mm), > 0
  * @param {string} curve     'linear' | 'scurve' | 'ease'
+ * @param {boolean} [faceInteriors]  bump-only display mesh: faces with every
+ *   corner on the boundary take their centroid's falloff (see below)
  * @returns {{ falloff: Float32Array, maskType: Float32Array } | null}
  *   per-corner ramp and boundary type (0 = user mask, 1 = angle mask); null
  *   when the layer has no boundary on this geometry
  */
-function computeBoundaryFalloff(geometry, userMaskedFaces, falloff, curve) {
+function computeBoundaryFalloff(geometry, userMaskedFaces, falloff, curve, faceInteriors = false) {
   const posAttr = geometry.attributes.position;
   const posCount = posAttr.count;
   const triCount = posCount / 3;
@@ -4337,28 +4342,16 @@ function computeBoundaryFalloff(geometry, userMaskedFaces, falloff, curve) {
   const searchY = Math.ceil(falloff / gDy);
   const searchZ = Math.ceil(falloff / gDz);
 
-  // Compute per-unique-position falloff factor and mask type.
-  // -1 = unset (keep the 1.0 default written into the attribute arrays).
-  const falloffById  = new Float32Array(nUnique).fill(-1);
-  const maskTypeById = new Float32Array(nUnique).fill(-1);
-  for (let id = 0; id < nUnique; id++) {
-    const frac = totalArea[id] > 0 ? maskedArea[id] / totalArea[id] : 0;
-    if (frac >= 1) continue; // fully masked vertex — keep 1.0 (mask zeroes it anyway)
-    // Boundary vertices (shared between masked and unmasked faces) are AT
-    // the boundary → distance 0 → falloff factor 0.
-    if (frac > 0) {
-      falloffById[id] = 0;
-      maskTypeById[id] = userMaskArea[id] > 0 ? 0 : 1;
-      continue;
-    }
-
-    const px = idPosX[id], py = idPosY[id], pz = idPosZ[id];
+  // Distance from a point to the nearest boundary position, capped at
+  // `falloff`; also sets nearestType to that position's mask type.
+  let nearestType = 1;
+  const boundaryDist = (px, py, pz) => {
     const cix = Math.max(0, Math.min(gRes - 1, Math.floor((px - gMinX) / gDx)));
     const ciy = Math.max(0, Math.min(gRes - 1, Math.floor((py - gMinY) / gDy)));
     const ciz = Math.max(0, Math.min(gRes - 1, Math.floor((pz - gMinZ) / gDz)));
 
     let minDist2 = falloff * falloff;
-    let nearestType = 1; // default: angle mask
+    nearestType = 1; // default: angle mask
     for (let dix = -searchX; dix <= searchX; dix++) {
       const nix = cix + dix;
       if (nix < 0 || nix >= gRes) continue;
@@ -4378,8 +4371,25 @@ function computeBoundaryFalloff(geometry, userMaskedFaces, falloff, curve) {
         }
       }
     }
-    const dist = Math.sqrt(minDist2);
-    const factor = Math.min(1, dist / falloff);
+    return Math.sqrt(minDist2);
+  };
+
+  // Compute per-unique-position falloff factor and mask type.
+  // -1 = unset (keep the 1.0 default written into the attribute arrays).
+  const falloffById  = new Float32Array(nUnique).fill(-1);
+  const maskTypeById = new Float32Array(nUnique).fill(-1);
+  for (let id = 0; id < nUnique; id++) {
+    const frac = totalArea[id] > 0 ? maskedArea[id] / totalArea[id] : 0;
+    if (frac >= 1) continue; // fully masked vertex — keep 1.0 (mask zeroes it anyway)
+    // Boundary vertices (shared between masked and unmasked faces) are AT
+    // the boundary → distance 0 → falloff factor 0.
+    if (frac > 0) {
+      falloffById[id] = 0;
+      maskTypeById[id] = userMaskArea[id] > 0 ? 0 : 1;
+      continue;
+    }
+
+    const factor = Math.min(1, boundaryDist(idPosX[id], idPosY[id], idPosZ[id]) / falloff);
     if (factor < 1) {
       falloffById[id] = applyFalloffCurve(factor, curve);
       maskTypeById[id] = nearestType;
@@ -4393,6 +4403,24 @@ function computeBoundaryFalloff(geometry, userMaskedFaces, falloff, curve) {
     const id = vertId[i];
     if (falloffById[id] >= 0) falloffArr[i] = falloffById[id];
     if (maskTypeById[id] >= 0) maskTypeArr[i] = maskTypeById[id];
+  }
+
+  // A textured face with every corner on the boundary reads 0 across its whole
+  // interior, though that interior can lie far from the boundary (a coarse
+  // cylinder's side triangles run rim to rim, so its bump-only preview showed
+  // no relief). Without vertex displacement the corners themselves never
+  // move, so give such a face the falloff at its centroid; the shader's
+  // per-fragment pass still fades the active layer at the boundary edges.
+  if (faceInteriors) {
+    for (let t = 0; t < triCount; t++) {
+      const i = t * 3;
+      const a = vertId[i], b = vertId[i + 1], c = vertId[i + 2];
+      if (faceMask[t] < 0.5 || falloffById[a] !== 0 || falloffById[b] !== 0 || falloffById[c] !== 0) continue;
+      const dist = boundaryDist((idPosX[a] + idPosX[b] + idPosX[c]) / 3,
+                                (idPosY[a] + idPosY[b] + idPosY[c]) / 3,
+                                (idPosZ[a] + idPosZ[b] + idPosZ[c]) / 3);
+      falloffArr[i] = falloffArr[i + 1] = falloffArr[i + 2] = applyFalloffCurve(Math.min(1, dist / falloff), curve);
+    }
   }
   return { falloff: falloffArr, maskType: maskTypeArr };
 }
@@ -4646,6 +4674,7 @@ function _syncPreviewMaterial() {
 }
 
 function updatePreview() {
+  gradientControls?.sync();
   if (!currentGeometry || !currentBounds) return;
 
   if (!_hasTexturedLayer()) {
@@ -4684,6 +4713,7 @@ function updatePreview() {
   bakeBtn.disabled = isBaking;
   updateSmartResBtnState();
   _renderLayerStrip();
+  _resumeDisplacementPreview();
 }
 
 // ── Displacement preview ──────────────────────────────────────────────────────
@@ -4808,6 +4838,25 @@ function cancelDisplacementPreviewBuild() {
   dispPreviewToken++;
   if (_previewWorkerAbort) _previewWorkerAbort();
   dispPreviewSpinner.classList.add('hidden');
+}
+
+/**
+ * Rebuild the 3D preview while its checkbox is ticked but no displaced mesh
+ * is shown or building: after a model load, rotation or bake, when a masking
+ * tool closes, and on startup. Deferred one task, so a load's several
+ * updatePreview() calls start one build, and module init never reaches the
+ * preview worker's state before it is declared.
+ */
+function _resumeDisplacementPreview() {
+  if (_dispPreviewResumeQueued) return;
+  _dispPreviewResumeQueued = true;
+  setTimeout(() => {
+    _dispPreviewResumeQueued = false;
+    if (dispPreviewToggle.checked && !settings.useDisplacement && !exclusionTool &&
+        currentGeometry && _hasTexturedLayer()) {
+      toggleDisplacementPreview(true);
+    }
+  }, 0);
 }
 
 /**
@@ -5419,10 +5468,10 @@ function adoptBakedGeometry(geometry, bounds, opts = {}) {
   // Replace the visible mesh in the viewer.
   loadGeometry(geometry);
 
-  // Reset displacement preview — its geometry referenced the pre-bake mesh.
+  // Drop the displacement preview — its geometry referenced the pre-bake
+  // mesh; updatePreview() rebuilds it while the 3D Preview box is ticked.
   if (dispPreviewGeometry) { dispPreviewGeometry.dispose(); dispPreviewGeometry = null; }
   settings.useDisplacement = false;
-  dispPreviewToggle.checked = false;
 
   // Reset mesh diagnostics — they referenced the pre-bake mesh.
   meshDiagnostics.classList.add('hidden');
@@ -5523,6 +5572,7 @@ try { localStorage.removeItem(PROJECT_STORAGE_KEY); } catch { /* ignore */ }
 
 // Persisted setting keys — excludes `useDisplacement` (transient UI state).
 const PERSISTED_KEYS = [
+  ...GRADIENT_KEYS,
   'mappingMode', 'scaleU', 'scaleV', 'lockScale',
   'offsetU', 'offsetV', 'rotation',
   'amplitude', 'textureHeight', 'invertDisplacement',
@@ -5600,6 +5650,7 @@ function _layerSettingsFrom(saved) {
       out.scaleU = m.scaleU; out.scaleV = m.scaleV;
     }
   }
+  Object.assign(out, normalizeGradientSettings(saved));
   out.scaleUnit = 'mm';
   return out;
 }
@@ -5708,6 +5759,10 @@ function _migrateSnapshotScaleToMm(snap) {
 function applySettingsSnapshot(snap) {
   if (!snap) return;
   snap = _migrateSnapshotScaleToMm(snap);
+  // Missing keys in older projects explicitly disable gradients rather than
+  // inheriting a gradient from the previously selected layer.
+  Object.assign(settings, normalizeGradientSettings(snap));
+  gradientControls?.sync();
 
   // Mapping mode first — changes cap-angle row visibility and triggers preview.
   if (snap.mappingMode != null) {
@@ -5885,6 +5940,7 @@ for (const btn of Object.values(falloffCurveButtons)) {
 // so applySettingsSnapshot's migration turns them into "0.5 × largest bbox
 // edge" mm for whatever model is currently loaded (the per-model default).
 const DEFAULT_SETTINGS_SNAPSHOT = Object.freeze({
+  ...GRADIENT_DEFAULTS,
   mappingMode: 5, scaleU: 0.5, scaleV: 0.5, lockScale: true,
   offsetU: 0, offsetV: 0, rotation: 0,
   amplitude: 0.5, textureHeight: 0.5, invertDisplacement: false,
@@ -6234,8 +6290,12 @@ async function importProject(file) {
       await _importLayers(unzipped, data, loadMode === 'all');
     } else {
       // Pre-layer project: a single layer, described by the top-level fields.
-      layers = [_newLayer()];
+      // It keeps the active layer's id so the paint already in that tree slot
+      // (the mask.json restored above, or the kept mask of a settings-only
+      // load) stays with it.
+      layers = [_newLayer({ id: layers[activeLayer].id })];
       activeLayer = 0;
+      _syncTreeLayers();
       await _applyImportedTexture(unzipped, data);
       _renderLayerStrip();
     }
@@ -6258,7 +6318,20 @@ async function importProject(file) {
  * over preset names), modes and — with the bundled model loaded — masks.
  */
 async function _importLayers(unzipped, data, withMasks) {
+  // Settings only keeps the current paint: imported layer i takes over the id
+  // (paint-tree slot) of current layer i, and its mask mode when masking was
+  // engaged, so the kept strokes still mean what they did. Current layers past
+  // the file's count are dropped with their paint; extra imported ones start empty.
+  const kept = withMasks ? [] : layers.map((L, i) => (i === activeLayer
+    ? { id: L.id, includeOnly: selectionMode, maskModeChosen }
+    : { id: L.id, includeOnly: !!L.includeOnly, maskModeChosen: !!L.maskModeChosen }));
   _layersFromSnapshot(data);
+  layers.forEach((L, i) => {
+    const k = kept[i];
+    if (!k) return;
+    L.id = k.id;
+    if (k.maskModeChosen) { L.includeOnly = k.includeOnly; L.maskModeChosen = true; }
+  });
   _syncTreeLayers();
   const files = data.layers.slice(0, layers.length);
   for (let i = 0; i < layers.length; i++) {
